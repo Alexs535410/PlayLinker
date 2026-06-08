@@ -30,8 +30,15 @@ public class GogController : ControllerBase
         _logger = logger;
     }
 
+    // 获取当前用户ID
+    private int GetCurrentUserId()
+    {
+        var userIdClaim = User.FindFirst("user_id")?.Value ?? User.FindFirst("sub")?.Value;
+        return int.TryParse(userIdClaim, out var userId) ? userId : 1;
+    }
+
     /// <summary>
-    /// 初始化平台数据
+    /// 初始化平台数据（优化版本：批量检查，减少数据库查询）
     /// </summary>
     private async Task InitializePlatformsAsync()
     {
@@ -47,49 +54,66 @@ public class GogController : ControllerBase
             new { Id = 8, Name = "Nintendo Switch", Description = "任天堂Switch平台" }
         };
 
+        // 批量检查所有平台ID和名称，只查询一次
+        var platformIds = platforms.Select(p => p.Id).ToList();
+        var platformNames = platforms.Select(p => p.Name).ToList();
+        
+        var existingPlatforms = await _context.Platforms
+            .Where(p => platformIds.Contains(p.PlatformId) || platformNames.Contains(p.PlatformName))
+            .Select(p => new { p.PlatformId, p.PlatformName })
+            .ToListAsync();
+
+        var existingIds = existingPlatforms.Select(p => p.PlatformId).ToHashSet();
+        var existingNames = existingPlatforms.Select(p => p.PlatformName).ToHashSet();
+
+        // 只插入不存在的平台
+        var platformsToInsert = platforms
+            .Where(p => !existingIds.Contains(p.Id) && !existingNames.Contains(p.Name))
+            .ToList();
+
+        if (platformsToInsert.Count == 0)
+        {
+            return; // 所有平台都已存在，无需操作
+        }
+
         var connection = _context.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open)
         {
             await connection.OpenAsync();
         }
 
-        foreach (var platformInfo in platforms)
+        // 批量插入（使用ON DUPLICATE KEY UPDATE避免重复）
+        foreach (var platformInfo in platformsToInsert)
         {
-            var exists = await _context.Platforms
-                .AnyAsync(p => p.PlatformId == platformInfo.Id || p.PlatformName == platformInfo.Name);
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                INSERT INTO platforms (platform_id, platform_name, description, status) 
+                VALUES (@id, @name, @desc, 1)
+                ON DUPLICATE KEY UPDATE platform_name = VALUES(platform_name), description = VALUES(description)";
+            
+            var idParam = command.CreateParameter();
+            idParam.ParameterName = "@id";
+            idParam.Value = platformInfo.Id;
+            command.Parameters.Add(idParam);
 
-            if (!exists)
+            var nameParam = command.CreateParameter();
+            nameParam.ParameterName = "@name";
+            nameParam.Value = platformInfo.Name;
+            command.Parameters.Add(nameParam);
+
+            var descParam = command.CreateParameter();
+            descParam.ParameterName = "@desc";
+            descParam.Value = platformInfo.Description ?? "";
+            command.Parameters.Add(descParam);
+
+            try
             {
-                using var command = connection.CreateCommand();
-                command.CommandText = @"
-                    INSERT INTO platforms (platform_id, platform_name, description, status) 
-                    VALUES (@id, @name, @desc, 1)
-                    ON DUPLICATE KEY UPDATE platform_name = VALUES(platform_name), description = VALUES(description)";
-                
-                var idParam = command.CreateParameter();
-                idParam.ParameterName = "@id";
-                idParam.Value = platformInfo.Id;
-                command.Parameters.Add(idParam);
-
-                var nameParam = command.CreateParameter();
-                nameParam.ParameterName = "@name";
-                nameParam.Value = platformInfo.Name;
-                command.Parameters.Add(nameParam);
-
-                var descParam = command.CreateParameter();
-                descParam.ParameterName = "@desc";
-                descParam.Value = platformInfo.Description ?? "";
-                command.Parameters.Add(descParam);
-
-                try
-                {
-                    await command.ExecuteNonQueryAsync();
-                    _logger.LogInformation("创建平台: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "创建平台失败: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
-                }
+                await command.ExecuteNonQueryAsync();
+                _logger.LogInformation("创建平台: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "创建平台失败: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
             }
         }
     }
@@ -107,9 +131,10 @@ public class GogController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("检查GOG令牌状态");
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("检查GOG令牌状态: userId={UserId}", userId);
 
-            var result = await _gogService.CheckTokenStatus();
+            var result = await _gogService.CheckTokenStatus(userId, 5);
 
             return Ok(ApiResponse<GogAuthResponseDto>.SuccessResponse(result, 
                 result.Success ? "令牌有效" : "令牌无效或不存在"));
@@ -181,9 +206,10 @@ public class GogController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("开始GOG认证, HasRedirectUrl={HasRedirectUrl}", !string.IsNullOrEmpty(request.RedirectUrl));
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("开始GOG认证: userId={UserId}, HasRedirectUrl={HasRedirectUrl}", userId, !string.IsNullOrEmpty(request.RedirectUrl));
 
-            var result = await _gogService.AuthenticateGog(request);
+            var result = await _gogService.AuthenticateGog(request, userId);
 
             if (!result.Success)
             {
@@ -239,14 +265,14 @@ public class GogController : ControllerBase
                 return BadRequest(ApiResponse<object>.ErrorResponse("BAD_REQUEST", $"用户ID {request.UserId} 不存在,请先创建用户"));
             }
 
-            var userId = request.UserId;
+            var userId = (int)request.UserId;
             _logger.LogInformation("导入GOG数据: userId={UserId}, gogUserId={GogUserId}", userId, request.GogUserId);
 
             // 初始化平台数据
             await InitializePlatformsAsync();
 
             // 获取GOG用户信息
-            var gogUser = await _gogService.GetGogUser(request.GogUserId);
+            var gogUser = await _gogService.GetGogUser(request.GogUserId, userId);
             if (gogUser == null)
             {
                 return BadRequest(ApiResponse<GogImportResponseDto>.ErrorResponse("ERR_GOG_USER_NOT_FOUND", "GOG用户不存在或令牌无效,请先进行认证"));
@@ -285,7 +311,7 @@ public class GogController : ControllerBase
             {
                 userPlatformBinding = new UserPlatformBinding
                 {
-                    UserId = userId,
+                    UserId = (int)userId,
                     PlatformId = GOG_PLATFORM_ID,
                     PlatformUserId = gogUser.GogUserId,
                     BindingStatus = true,
@@ -297,9 +323,12 @@ public class GogController : ControllerBase
             }
             else
             {
+                // 更新绑定时，更新绑定时间和同步时间
                 userPlatformBinding.PlatformUserId = gogUser.GogUserId;
                 userPlatformBinding.BindingStatus = true;
-                userPlatformBinding.LastSyncTime = DateTime.UtcNow;
+                userPlatformBinding.BindingTime = DateTime.UtcNow; // 更新绑定时间
+                userPlatformBinding.LastSyncTime = DateTime.UtcNow; // 更新同步时间
+                userPlatformBinding.ExpireTime = DateTime.UtcNow.AddYears(1); // 更新过期时间
             }
             await _context.SaveChangesAsync();
 
@@ -314,19 +343,168 @@ public class GogController : ControllerBase
                     // 获取完整的GOG游戏数据
                     _logger.LogInformation("开始导入GOG游戏数据...");
                     
-                    var gogGames = await _gogService.GetGogUserGames(request.GogUserId);
+                    var gogGames = await _gogService.GetGogUserGames(request.GogUserId, userId);
+                    
+                    _logger.LogInformation("开始处理 {Count} 个GOG游戏", gogGames.Count);
                     
                     foreach (var gogGame in gogGames)
                     {
                         try
                         {
-                            // 查找或创建游戏
-                            var game = await _context.Games
+                            if (string.IsNullOrEmpty(gogGame.Name))
+                            {
+                                _logger.LogWarning("跳过游戏：名称为空，GameId={GameId}", gogGame.GogGameId);
+                                continue;
+                            }
+                            
+                            // 先通过游戏名称查找是否已存在同名游戏（不同平台的同名游戏共享同一个game_id）
+                            Game? game = await _context.Games
                                 .FirstOrDefaultAsync(g => g.Name == gogGame.Name);
+                            
+                            if (game != null)
+                            {
+                                _logger.LogInformation("找到已存在的同名游戏: GameId={GameId}, Name={Name}，将更新游戏信息", game.GameId, game.Name);
+                            }
 
+                            // 如果游戏已存在，更新游戏信息（只补充缺失的字段，不覆盖已有数据）
+                            if (game != null)
+                            {
+                                bool hasChanges = false;
+                                
+                                // 更新游戏名称（如果当前名称为空或使用默认名称）
+                                if (string.IsNullOrEmpty(game.Name) || game.Name.StartsWith("GOG Game "))
+                                {
+                                    game.Name = gogGame.Name;
+                                    hasChanges = true;
+                                }
+                                
+                                // 只有当字段为空时才更新，避免覆盖其他平台的数据
+                                if (string.IsNullOrEmpty(game.ShortDescription) && !string.IsNullOrEmpty(gogGame.ShortDescription))
+                                {
+                                    game.ShortDescription = gogGame.ShortDescription;
+                                    hasChanges = true;
+                                }
+                                
+                                if (string.IsNullOrEmpty(game.DetailedDescription) && !string.IsNullOrEmpty(gogGame.DetailedDescription))
+                                {
+                                    game.DetailedDescription = gogGame.DetailedDescription;
+                                    hasChanges = true;
+                                }
+                                
+                                if (string.IsNullOrEmpty(game.HeaderImage) && !string.IsNullOrEmpty(gogGame.HeaderImage))
+                                {
+                                    // 确保图片URL是完整的（处理 // 开头的相对路径）
+                                    var headerImage = gogGame.HeaderImage;
+                                    if (headerImage.StartsWith("//"))
+                                    {
+                                        headerImage = "https:" + headerImage;
+                                    }
+                                    else if (!headerImage.StartsWith("http"))
+                                    {
+                                        headerImage = "https://" + headerImage;
+                                    }
+                                    
+                                    // 如果URL没有扩展名，添加 .jpg
+                                    if (!headerImage.Contains(".") || (!headerImage.EndsWith(".jpg") && !headerImage.EndsWith(".jpeg") && !headerImage.EndsWith(".png") && !headerImage.EndsWith(".webp")))
+                                    {
+                                        headerImage = headerImage.TrimEnd('/') + ".jpg";
+                                    }
+                                    
+                                    game.HeaderImage = headerImage;
+                                    game.CapsuleImage = headerImage;
+                                    game.Background = headerImage;
+                                    hasChanges = true;
+                                }
+                                
+                                if (game.ReleaseDate == default(DateTime) && !string.IsNullOrEmpty(gogGame.ReleaseDate) 
+                                    && DateTime.TryParse(gogGame.ReleaseDate, out var releaseDate))
+                                {
+                                    game.ReleaseDate = releaseDate;
+                                    hasChanges = true;
+                                }
+                                
+                                // 更新平台支持信息（如果当前没有设置）
+                                if (!game.Windows && !game.Mac && !game.Linux)
+                                {
+                                    game.Windows = gogGame.Platforms?.Windows ?? false;
+                                    game.Mac = gogGame.Platforms?.Mac ?? false;
+                                    game.Linux = gogGame.Platforms?.Linux ?? false;
+                                    hasChanges = true;
+                                }
+                                
+                                if (hasChanges)
+                                {
+                                    await _context.SaveChangesAsync();
+                                    _logger.LogInformation("已更新游戏信息: GameId={GameId}, Name={Name}", game.GameId, game.Name);
+                                }
+
+                                // 只添加新的开发商和发行商关联，不删除已有的
+                                if (gogGame.Developers.Count > 0)
+                                {
+                                    foreach (var devName in gogGame.Developers)
+                                    {
+                                        if (string.IsNullOrEmpty(devName)) continue;
+                                        var truncatedName = devName.Length > 20 ? devName.Substring(0, 20) : devName;
+                                        var developer = await _context.Developers.FirstOrDefaultAsync(d => d.Name == truncatedName);
+                                        if (developer == null)
+                                        {
+                                            developer = new Developer { Name = truncatedName };
+                                            _context.Developers.Add(developer);
+                                            await _context.SaveChangesAsync();
+                                        }
+                                        if (!await _context.GameDevelopers.AnyAsync(gd => gd.GameId == game.GameId && gd.DeveloperId == developer.DeveloperId))
+                                        {
+                                            _context.GameDevelopers.Add(new GameDeveloper { GameId = game.GameId, DeveloperId = developer.DeveloperId });
+                                        }
+                                    }
+                                }
+
+                                if (gogGame.Publishers.Count > 0)
+                                {
+                                    foreach (var pubName in gogGame.Publishers)
+                                    {
+                                        if (string.IsNullOrEmpty(pubName)) continue;
+                                        var truncatedName = pubName.Length > 20 ? pubName.Substring(0, 20) : pubName;
+                                        var publisher = await _context.Publishers.FirstOrDefaultAsync(p => p.Name == truncatedName);
+                                        if (publisher == null)
+                                        {
+                                            publisher = new Publisher { Name = truncatedName };
+                                            _context.Publishers.Add(publisher);
+                                            await _context.SaveChangesAsync();
+                                        }
+                                        if (!await _context.GamePublishers.AnyAsync(gp => gp.GameId == game.GameId && gp.PublisherId == publisher.PublisherId))
+                                        {
+                                            _context.GamePublishers.Add(new GamePublisher { GameId = game.GameId, PublisherId = publisher.PublisherId });
+                                        }
+                                    }
+                                }
+                                await _context.SaveChangesAsync();
+                            }
+
+                            // 如果游戏不存在，创建新游戏
                             if (game == null)
                             {
                                 // 创建新游戏
+                                // 确保图片URL是完整的（处理 // 开头的相对路径）
+                                var headerImage = gogGame.HeaderImage ?? "";
+                                if (!string.IsNullOrEmpty(headerImage))
+                                {
+                                    if (headerImage.StartsWith("//"))
+                                    {
+                                        headerImage = "https:" + headerImage;
+                                    }
+                                    else if (!headerImage.StartsWith("http"))
+                                    {
+                                        headerImage = "https://" + headerImage;
+                                    }
+                                    
+                                    // 如果URL没有扩展名，添加 .jpg
+                                    if (!headerImage.Contains(".") || (!headerImage.EndsWith(".jpg") && !headerImage.EndsWith(".jpeg") && !headerImage.EndsWith(".png") && !headerImage.EndsWith(".webp")))
+                                    {
+                                        headerImage = headerImage.TrimEnd('/') + ".jpg";
+                                    }
+                                }
+                                
                                 game = new Game
                                 {
                                     Name = gogGame.Name,
@@ -334,9 +512,9 @@ public class GogController : ControllerBase
                                     RequireAge = (byte?)gogGame.RequiredAge,
                                     ShortDescription = gogGame.ShortDescription,
                                     DetailedDescription = gogGame.DetailedDescription,
-                                    HeaderImage = gogGame.HeaderImage,
-                                    CapsuleImage = gogGame.HeaderImage,
-                                    Background = gogGame.HeaderImage,
+                                    HeaderImage = headerImage,
+                                    CapsuleImage = headerImage,
+                                    Background = headerImage,
                                     Windows = gogGame.Platforms.Windows,
                                     Mac = gogGame.Platforms.Mac,
                                     Linux = gogGame.Platforms.Linux,
@@ -386,8 +564,11 @@ public class GogController : ControllerBase
                                 }
                             }
 
-                            // 创建或更新游戏平台映射
-                            if (!await _context.GamePlatforms.AnyAsync(gp => gp.GameId == game.GameId && gp.PlatformId == GOG_PLATFORM_ID))
+                            // 创建或更新游戏平台映射（如果该平台映射不存在）
+                            var gamePlatform = await _context.GamePlatforms
+                                .FirstOrDefaultAsync(gp => gp.GameId == game.GameId && gp.PlatformId == GOG_PLATFORM_ID);
+                            
+                            if (gamePlatform == null)
                             {
                                 _context.GamePlatforms.Add(new GamePlatform
                                 {
@@ -396,6 +577,14 @@ public class GogController : ControllerBase
                                     PlatformGameId = gogGame.GogGameId,
                                     GamePlatformUrl = $"https://www.gog.com/game/{gogGame.GogGameId}"
                                 });
+                                await _context.SaveChangesAsync();
+                            }
+                            else if (gamePlatform.PlatformGameId != gogGame.GogGameId)
+                            {
+                                // 更新平台游戏ID（如果不同）
+                                gamePlatform.PlatformGameId = gogGame.GogGameId;
+                                gamePlatform.GamePlatformUrl = $"https://www.gog.com/game/{gogGame.GogGameId}";
+                                await _context.SaveChangesAsync();
                             }
 
                             // 创建或更新用户平台游戏库记录
@@ -443,6 +632,14 @@ public class GogController : ControllerBase
                     }
                     
                     _logger.LogInformation("成功导入 {Count} 个GOG游戏", gamesCount);
+                    
+                    // 导入完成后，更新LastSyncTime
+                    if (userPlatformBinding != null)
+                    {
+                        userPlatformBinding.LastSyncTime = DateTime.UtcNow;
+                        await _context.SaveChangesAsync();
+                        _logger.LogInformation("已更新LastSyncTime: {LastSyncTime}", userPlatformBinding.LastSyncTime);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -483,9 +680,10 @@ public class GogController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("获取GOG用户信息: gogUserId={GogUserId}", gogUserId);
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("获取GOG用户信息: gogUserId={GogUserId}, userId={UserId}", gogUserId, userId);
 
-            var result = await _gogService.GetGogUser(gogUserId);
+            var result = await _gogService.GetGogUser(gogUserId, userId);
 
             if (result == null)
             {
@@ -512,9 +710,10 @@ public class GogController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("获取GOG游戏信息: gogGameId={GogGameId}", gogGameId);
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("获取GOG游戏信息: gogGameId={GogGameId}, userId={UserId}", gogGameId, userId);
 
-            var result = await _gogService.GetGogGame(gogGameId);
+            var result = await _gogService.GetGogGame(gogGameId, userId);
 
             if (result == null)
             {

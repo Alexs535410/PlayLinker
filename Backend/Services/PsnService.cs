@@ -1,4 +1,7 @@
 using PlayLinker.Models.DTOs;
+using PlayLinker.Models.Entities;
+using PlayLinker.Data;
+using Microsoft.EntityFrameworkCore;
 using System.Diagnostics;
 using System.Text.Json;
 
@@ -12,14 +15,23 @@ public class PsnService : IPsnService
 {
     private readonly IConfiguration _configuration;
     private readonly ILogger<PsnService> _logger;
+    private readonly ITokenEncryptionService _encryptionService;
+    private readonly PlayLinkerDbContext _context;
     private readonly string _nodePath;
     private readonly string _scriptsPath;
     private readonly string _tokensPath;
 
-    public PsnService(IConfiguration configuration, ILogger<PsnService> logger, IWebHostEnvironment environment)
+    public PsnService(
+        IConfiguration configuration, 
+        ILogger<PsnService> logger, 
+        IWebHostEnvironment environment,
+        ITokenEncryptionService encryptionService,
+        PlayLinkerDbContext context)
     {
         _configuration = configuration;
         _logger = logger;
+        _encryptionService = encryptionService;
+        _context = context;
 
         // 获取Node.js路径(从配置或环境变量)
         _nodePath = configuration["PsnAPI:NodePath"] ?? "node";
@@ -158,6 +170,169 @@ public class PsnService : IPsnService
     }
 
     /// <summary>
+    /// 从数据库加载令牌到临时文件
+    /// </summary>
+    private async Task<string?> LoadTokenFromDatabase(int userId, int platformId)
+    {
+        try
+        {
+            var binding = await _context.UserPlatformBindings
+                .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == platformId && b.BindingStatus == true);
+            
+            if (binding == null || string.IsNullOrEmpty(binding.AccessToken))
+            {
+                _logger.LogWarning("用户{UserId}未绑定平台{PlatformId}或令牌为空", userId, platformId);
+                return null;
+            }
+            
+            var decryptedToken = _encryptionService.DecryptToken(binding.AccessToken);
+            var tempFilePath = Path.Combine(_tokensPath, $"psn_tokens_{userId}_{Guid.NewGuid():N}.json");
+            await File.WriteAllTextAsync(tempFilePath, decryptedToken);
+            
+            _logger.LogInformation("令牌已从数据库加载到临时文件: {TempFile}", tempFilePath);
+            return tempFilePath;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "从数据库加载令牌失败");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 保存令牌到数据库（如果绑定不存在则创建）
+    /// </summary>
+    private async Task<bool> SaveTokenToDatabase(int userId, int platformId, string tokenJson, string? onlineId = null)
+    {
+        try
+        {
+            var binding = await _context.UserPlatformBindings
+                .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == platformId);
+            
+            if (binding != null)
+            {
+                // 更新现有绑定
+                var encryptedToken = _encryptionService.EncryptToken(tokenJson);
+                binding.AccessToken = encryptedToken;
+                binding.LastSyncTime = DateTime.UtcNow;
+                binding.ExpireTime = DateTime.UtcNow.AddYears(1);
+                binding.BindingStatus = true;
+                
+                // 如果提供了OnlineId，更新PlatformUserId
+                if (!string.IsNullOrEmpty(onlineId))
+                {
+                    binding.PlatformUserId = onlineId;
+                }
+                
+                await _context.SaveChangesAsync();
+                
+                _logger.LogInformation("令牌已更新到数据库: UserId={UserId}, PlatformId={PlatformId}", userId, platformId);
+                return true;
+            }
+            
+            // 绑定不存在，需要创建
+            if (string.IsNullOrEmpty(onlineId))
+            {
+                _logger.LogWarning("未找到绑定记录且未提供OnlineId，无法创建绑定: UserId={UserId}, PlatformId={PlatformId}", userId, platformId);
+                return false;
+            }
+            
+            // 先确保PlayerPlatform记录存在（外键约束要求）
+            var playerPlatform = await _context.PlayerPlatforms
+                .FirstOrDefaultAsync(pp => pp.PlatformUserId == onlineId && pp.PlatformId == platformId);
+            
+            if (playerPlatform == null)
+            {
+                // 注意：此时令牌还未保存，无法调用GetPsnUser（需要令牌）
+                // 先使用基本信息创建PlayerPlatform记录，后续可以通过同步更新
+                _logger.LogInformation("创建PlayerPlatform记录: OnlineId={OnlineId}", onlineId);
+                playerPlatform = new PlayerPlatform
+                {
+                    PlatformUserId = onlineId,
+                    PlatformId = platformId,
+                    ProfileName = onlineId  // 暂时使用OnlineId作为ProfileName，后续可以更新
+                };
+                _context.PlayerPlatforms.Add(playerPlatform);
+                
+                try
+                {
+                    await _context.SaveChangesAsync();
+                    _logger.LogInformation("已创建PlayerPlatform记录: OnlineId={OnlineId}", onlineId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "创建PlayerPlatform记录失败: OnlineId={OnlineId}", onlineId);
+                    throw; // 重新抛出异常，因为这是必需的
+                }
+            }
+            
+            // 确保playerPlatform已保存（重新查询以确保数据一致性）
+            playerPlatform = await _context.PlayerPlatforms
+                .FirstOrDefaultAsync(pp => pp.PlatformUserId == onlineId && pp.PlatformId == platformId);
+
+            if (playerPlatform == null)
+            {
+                _logger.LogError("PlayerPlatform记录不存在，无法创建绑定: OnlineId={OnlineId}, PlatformId={PlatformId}", onlineId, platformId);
+                return false;
+            }
+            
+            // 创建新的绑定记录
+            var encryptedTokenForNewBinding = _encryptionService.EncryptToken(tokenJson);
+            binding = new UserPlatformBinding
+            {
+                UserId = userId,
+                PlatformId = platformId,
+                PlatformUserId = onlineId,  // 必须与playerPlatform.PlatformUserId完全一致
+                AccessToken = encryptedTokenForNewBinding,
+                BindingStatus = true,
+                BindingTime = DateTime.UtcNow,
+                LastSyncTime = DateTime.UtcNow,
+                ExpireTime = DateTime.UtcNow.AddYears(1) // PSN令牌有效期1年
+            };
+            
+            _context.UserPlatformBindings.Add(binding);
+            
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "保存UserPlatformBinding失败: OnlineId={OnlineId}, PlatformId={PlatformId}, PlayerPlatform存在={PlayerPlatformExists}", 
+                    onlineId, platformId, playerPlatform != null);
+                throw;
+            }
+            
+            _logger.LogInformation("已创建绑定记录并保存令牌: UserId={UserId}, PlatformId={PlatformId}, OnlineId={OnlineId}", userId, platformId, onlineId);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "保存令牌到数据库失败");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 清理临时令牌文件
+    /// </summary>
+    private void CleanupTempTokenFile(string? tempFilePath)
+    {
+        try
+        {
+            if (!string.IsNullOrEmpty(tempFilePath) && File.Exists(tempFilePath))
+            {
+                File.Delete(tempFilePath);
+                _logger.LogInformation("临时令牌文件已删除: {TempFile}", tempFilePath);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "删除临时令牌文件失败: {TempFile}", tempFilePath);
+        }
+    }
+
+    /// <summary>
     /// 测试Node.js环境
     /// </summary>
     private async Task<(bool success, string message)> TestNodeEnvironment()
@@ -212,28 +387,27 @@ public class PsnService : IPsnService
     }
 
     /// <summary>
-    /// 检查令牌状态
+    /// 检查令牌状态（从数据库）
     /// </summary>
-    public async Task<PsnAuthResponseDto> CheckTokenStatus(string? tokensPath = null)
+    public async Task<PsnAuthResponseDto> CheckTokenStatus(int userId, int platformId = 6)
     {
         try
         {
-            var tokenPath = GetTokenFilePath(tokensPath);
-            var tokenExists = File.Exists(tokenPath);
+            var binding = await _context.UserPlatformBindings
+                .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == platformId && b.BindingStatus == true);
 
-            if (!tokenExists)
+            if (binding == null || string.IsNullOrEmpty(binding.AccessToken))
             {
                 return new PsnAuthResponseDto
                 {
                     Success = false,
-                    Message = "令牌文件不存在,需要首次认证",
-                    TokenExists = false,
-                    TokensPath = tokenPath
+                    Message = "用户未绑定PSN平台或令牌不存在，需要首次认证",
+                    TokenExists = false
                 };
             }
 
-            // 尝试使用令牌获取数据(验证令牌有效性)
-            var psnData = await GetPsnDataFromNode(tokensPath);
+            // 尝试使用令牌获取数据（验证令牌有效性）
+            var psnData = await GetPsnDataFromNode(userId, platformId);
             
             if (psnData != null && psnData.RootElement.TryGetProperty("success", out var success) && success.GetBoolean())
             {
@@ -246,7 +420,6 @@ public class PsnService : IPsnService
                     Success = true,
                     Message = "令牌有效",
                     TokenExists = true,
-                    TokensPath = tokenPath,
                     AccountId = accountId,
                     OnlineId = onlineId
                 };
@@ -256,9 +429,8 @@ public class PsnService : IPsnService
                 return new PsnAuthResponseDto
                 {
                     Success = false,
-                    Message = "令牌已过期或无效,需要重新认证",
-                    TokenExists = true,
-                    TokensPath = tokenPath
+                    Message = "令牌已过期或无效，需要重新认证",
+                    TokenExists = true
                 };
             }
         }
@@ -277,11 +449,12 @@ public class PsnService : IPsnService
     /// <summary>
     /// 执行PSN认证
     /// </summary>
-    public async Task<PsnAuthResponseDto> AuthenticatePsn(PsnAuthRequestDto request)
+    public async Task<PsnAuthResponseDto> AuthenticatePsn(PsnAuthRequestDto request, int userId)
     {
+        string? tempTokenPath = null;
         try
         {
-            _logger.LogInformation("开始PSN认证");
+            _logger.LogInformation("开始PSN认证: userId={UserId}", userId);
 
             if (string.IsNullOrWhiteSpace(request.Npsso))
             {
@@ -293,13 +466,21 @@ public class PsnService : IPsnService
                 };
             }
 
-            var tokenPath = GetTokenFilePath(request.TokensPath);
+            // 使用临时文件进行认证
+            tempTokenPath = Path.Combine(_tokensPath, $"psn_tokens_auth_{userId}_{Guid.NewGuid():N}.json");
             
-            // 如果强制重新认证,删除旧令牌
-            if (request.ForceReauth && File.Exists(tokenPath))
+            // 如果强制重新认证，删除数据库中的旧令牌
+            if (request.ForceReauth)
             {
-                File.Delete(tokenPath);
-                _logger.LogInformation("已删除旧令牌文件");
+                var binding = await _context.UserPlatformBindings
+                    .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == 6);
+                if (binding != null)
+                {
+                    binding.AccessToken = null;
+                    binding.BindingStatus = false;
+                    await _context.SaveChangesAsync();
+                    _logger.LogInformation("已删除数据库中的旧令牌");
+                }
             }
 
             // 测试Node.js环境
@@ -307,19 +488,18 @@ public class PsnService : IPsnService
             var (envSuccess, envMessage) = await TestNodeEnvironment();
             if (!envSuccess)
             {
-                _logger.LogError("Node.js环境检查失败: {Message}", envMessage);
+                    _logger.LogError("Node.js环境检查失败: {Message}", envMessage);
                 return new PsnAuthResponseDto
                 {
                     Success = false,
                     Message = $"Node.js环境问题: {envMessage}",
-                    TokenExists = File.Exists(tokenPath),
-                    TokensPath = tokenPath
+                    TokenExists = false
                 };
             }
             _logger.LogInformation("Node.js环境检查通过");
 
             // 执行认证脚本
-            var arguments = $"--npsso \"{request.Npsso}\" --tokens \"{tokenPath}\"";
+            var arguments = $"--npsso \"{request.Npsso}\" --tokens \"{tempTokenPath}\"";
             
             int exitCode;
             string output;
@@ -360,8 +540,7 @@ public class PsnService : IPsnService
                     {
                         Success = false,
                         Message = errorMessage,
-                        TokenExists = File.Exists(tokenPath),
-                        TokensPath = tokenPath
+                        TokenExists = false
                     };
                 }
             }
@@ -372,8 +551,7 @@ public class PsnService : IPsnService
                 {
                     Success = false,
                     Message = $"执行认证脚本失败: {ex.Message}",
-                    TokenExists = File.Exists(tokenPath),
-                    TokensPath = tokenPath
+                    TokenExists = false
                 };
             }
 
@@ -393,13 +571,37 @@ public class PsnService : IPsnService
                 
                 if (result != null && result.ContainsKey("success") && result["success"].GetBoolean())
                 {
+                    // 获取OnlineId（用于创建绑定）
+                    string? onlineId = result.ContainsKey("onlineId") ? result["onlineId"].GetString() : null;
+                    
+                    // 认证成功，读取令牌文件并保存到数据库（需要onlineId来创建绑定记录）
+                    if (File.Exists(tempTokenPath))
+                    {
+                        try
+                        {
+                            var tokenJson = await File.ReadAllTextAsync(tempTokenPath);
+                            var saveSuccess = await SaveTokenToDatabase(userId, 6, tokenJson, onlineId);
+                            if (saveSuccess)
+                            {
+                                _logger.LogInformation("令牌已保存到数据库: OnlineId={OnlineId}", onlineId);
+                            }
+                            else
+                            {
+                                _logger.LogWarning("令牌保存失败，但认证已成功");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "保存令牌到数据库失败");
+                        }
+                    }
+                    
                     return new PsnAuthResponseDto
                     {
                         Success = true,
                         Message = result.ContainsKey("message") ? result["message"].GetString() ?? "认证成功" : "认证成功",
                         AccountId = result.ContainsKey("accountId") ? result["accountId"].GetString() : null,
-                        OnlineId = result.ContainsKey("onlineId") ? result["onlineId"].GetString() : null,
-                        TokensPath = tokenPath,
+                        OnlineId = onlineId,
                         TokenExists = true
                     };
                 }
@@ -409,8 +611,7 @@ public class PsnService : IPsnService
                     {
                         Success = false,
                         Message = result?.ContainsKey("message") == true ? result["message"].GetString() ?? "认证失败" : "认证失败",
-                        TokenExists = File.Exists(tokenPath),
-                        TokensPath = tokenPath
+                        TokenExists = false
                     };
                 }
             }
@@ -421,8 +622,7 @@ public class PsnService : IPsnService
                 {
                     Success = false,
                     Message = $"解析认证结果失败: {ex.Message}",
-                    TokenExists = File.Exists(tokenPath),
-                    TokensPath = tokenPath
+                    TokenExists = false
                 };
             }
         }
@@ -436,24 +636,34 @@ public class PsnService : IPsnService
                 TokenExists = false
             };
         }
+        finally
+        {
+            // 清理临时文件
+            CleanupTempTokenFile(tempTokenPath);
+        }
     }
 
     /// <summary>
     /// 获取PSN数据
     /// </summary>
-    private async Task<JsonDocument?> GetPsnDataFromNode(string? tokensPath = null)
+    /// <summary>
+    /// 获取PSN数据（支持用户级令牌）
+    /// </summary>
+    private async Task<JsonDocument?> GetPsnDataFromNode(int userId, int platformId = 6)
     {
+        string? tempFilePath = null;
         try
         {
-            var tokenPath = GetTokenFilePath(tokensPath);
+            // 从数据库加载令牌到临时文件
+            tempFilePath = await LoadTokenFromDatabase(userId, platformId);
             
-            if (!File.Exists(tokenPath))
+            if (tempFilePath == null)
             {
-                _logger.LogWarning("令牌文件不存在: {TokenPath}", tokenPath);
+                _logger.LogWarning("无法加载用户{UserId}的令牌", userId);
                 return null;
             }
 
-            var arguments = $"--tokens \"{tokenPath}\"";
+            var arguments = $"--tokens \"{tempFilePath}\"";
             var (exitCode, output, error) = await RunNodeScript("psn_get_data.js", arguments);
 
             _logger.LogInformation("Node.js脚本执行完成: ExitCode={ExitCode}", exitCode);
@@ -549,6 +759,21 @@ public class PsnService : IPsnService
                 }
                 
                 _logger.LogInformation("成功解析PSN数据JSON");
+                
+                // 成功后保存更新的令牌
+                if (File.Exists(tempFilePath))
+                {
+                    try
+                    {
+                        var updatedToken = await File.ReadAllTextAsync(tempFilePath);
+                        await SaveTokenToDatabase(userId, platformId, updatedToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "保存更新的令牌失败，但数据获取成功");
+                    }
+                }
+                
                 return doc;
             }
             catch (JsonException ex)
@@ -571,22 +796,27 @@ public class PsnService : IPsnService
             _logger.LogError(ex, "获取PSN数据时发生错误");
             return null;
         }
+        finally
+        {
+            // 清理临时文件
+            CleanupTempTokenFile(tempFilePath);
+        }
     }
 
     /// <summary>
     /// 导入PSN数据
     /// </summary>
-    public async Task<PsnImportResponseDto> ImportPsnData(PsnImportRequestDto request)
+    public async Task<PsnImportResponseDto> ImportPsnData(PsnImportRequestDto request, int userId)
     {
         try
         {
-            _logger.LogInformation("开始导入PSN数据: psnOnlineId={OnlineId}", request.PsnOnlineId);
+            _logger.LogInformation("开始导入PSN数据: psnOnlineId={OnlineId}, userId={UserId}", request.PsnOnlineId, userId);
 
             var taskId = $"psn_import_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
             
             // 获取PSN数据
             _logger.LogInformation("正在调用Node.js脚本获取PSN数据...");
-            var psnData = await GetPsnDataFromNode();
+            var psnData = await GetPsnDataFromNode(userId, 6);
             
             if (psnData == null)
             {
@@ -684,13 +914,13 @@ public class PsnService : IPsnService
     /// <summary>
     /// 获取PSN用户信息
     /// </summary>
-    public async Task<PsnUserDto?> GetPsnUser(string onlineId)
+    public async Task<PsnUserDto?> GetPsnUser(string onlineId, int userId)
     {
         try
         {
-            _logger.LogInformation("获取PSN用户信息: onlineId={OnlineId}", onlineId);
+            _logger.LogInformation("获取PSN用户信息: onlineId={OnlineId}, userId={UserId}", onlineId, userId);
 
-            var psnData = await GetPsnDataFromNode();
+            var psnData = await GetPsnDataFromNode(userId, 6);
             
             if (psnData == null)
             {
@@ -761,13 +991,13 @@ public class PsnService : IPsnService
     /// <summary>
     /// 获取PSN游戏信息
     /// </summary>
-    public async Task<PsnGameDto?> GetPsnGame(string titleId)
+    public async Task<PsnGameDto?> GetPsnGame(string titleId, int userId)
     {
         try
         {
-            _logger.LogInformation("获取PSN游戏信息: titleId={TitleId}", titleId);
+            _logger.LogInformation("获取PSN游戏信息: titleId={TitleId}, userId={UserId}", titleId, userId);
 
-            var psnData = await GetPsnDataFromNode();
+            var psnData = await GetPsnDataFromNode(userId, 6);
             
             if (psnData == null)
             {
@@ -826,13 +1056,13 @@ public class PsnService : IPsnService
     /// <summary>
     /// 获取PSN用户的游戏列表(用于导入)
     /// </summary>
-    public async Task<List<PsnGameDto>> GetPsnUserGames(string onlineId)
+    public async Task<List<PsnGameDto>> GetPsnUserGames(string onlineId, int userId)
     {
         try
         {
-            _logger.LogInformation("获取PSN用户游戏列表: onlineId={OnlineId}", onlineId);
+            _logger.LogInformation("获取PSN用户游戏列表: onlineId={OnlineId}, userId={UserId}", onlineId, userId);
 
-            var psnData = await GetPsnDataFromNode();
+            var psnData = await GetPsnDataFromNode(userId, 6);
             
             if (psnData == null)
             {
@@ -899,13 +1129,13 @@ public class PsnService : IPsnService
     /// <summary>
     /// 获取PSN用户奖杯
     /// </summary>
-    public async Task<PsnUserTrophiesResponseDto> GetPsnUserTrophies(string onlineId)
+    public async Task<PsnUserTrophiesResponseDto> GetPsnUserTrophies(string onlineId, int userId)
     {
         try
         {
-            _logger.LogInformation("获取PSN用户奖杯: onlineId={OnlineId}", onlineId);
+            _logger.LogInformation("获取PSN用户奖杯: onlineId={OnlineId}, userId={UserId}", onlineId, userId);
 
-            var psnData = await GetPsnDataFromNode();
+            var psnData = await GetPsnDataFromNode(userId, 6);
             
             if (psnData == null)
             {

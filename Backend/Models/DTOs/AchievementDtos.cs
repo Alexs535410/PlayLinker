@@ -26,6 +26,8 @@ public class AchievementDto
     public double GlobalUnlockRate { get; set; }
     public bool? Unlocked { get; set; }
     public string? UnlockTime { get; set; }
+    public int PlatformId { get; set; }
+    public string? PlatformName { get; set; }
 }
 
 /// <summary>
@@ -68,6 +70,7 @@ public class RareAchievementDto
     public string DisplayName { get; set; } = string.Empty;
     public double GlobalUnlockRate { get; set; }
     public string UnlockTime { get; set; } = string.Empty;
+    public string IconUnlocked { get; set; } = string.Empty;
 }
 
 /// <summary>
@@ -85,7 +88,7 @@ public class AchievementStatisticsDto
 /// </summary>
 public class SyncAchievementsRequestDto
 {
-    public int UserId { get; set; }
+    public long UserId { get; set; }
     public int? PlatformId { get; set; }
     public long? GameId { get; set; }
 }

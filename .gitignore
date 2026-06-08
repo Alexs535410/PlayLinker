@@ -73,7 +73,20 @@ appsettings.Production.json
 **/appsettings.*.json
 !**/appsettings.json
 
+# Build publish output (generated on server/CI, contains no secrets in repo)
+Backend/publish/
+Backend/publish.zip
+
 # Xbox API Tokens (sensitive)
 Backend/Tokens/
 **/xbox_tokens.json
 
+# SSH Keys (sensitive)
+*.pem
+github-deploy.pem
+
+1210_1041.md
+1216_1824.md
+1216_1916.md
+1216_1904.md
+Frontend/FRONTEND_TESTING_GUIDE.md

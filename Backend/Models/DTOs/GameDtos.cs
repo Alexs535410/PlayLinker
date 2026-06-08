@@ -55,6 +55,8 @@ public class GameDetailDto
     public List<CategoryDto> Categories { get; set; } = new();
     public List<LanguageDto> Languages { get; set; } = new();
     public PlatformSupportDto Platforms { get; set; } = new();
+    public List<int> PlatformIds { get; set; } = new(); // 游戏支持的所有平台ID（Steam、Xbox等）
+    public List<GamePlatformDto> GamePlatforms { get; set; } = new(); // 游戏平台信息（包含商店链接）
     public string ReleaseDate { get; set; } = string.Empty;
     public GameReviewsDto Reviews { get; set; } = new();
 }
@@ -109,7 +111,7 @@ public class GenreDto
 /// </summary>
 public class DeveloperDto
 {
-    public int DeveloperId { get; set; }
+    public long DeveloperId { get; set; }
     public string Name { get; set; } = string.Empty;
     public int? GamesCount { get; set; }
 }
@@ -119,7 +121,7 @@ public class DeveloperDto
 /// </summary>
 public class PublisherDto
 {
-    public int PublisherId { get; set; }
+    public long PublisherId { get; set; }
     public string Name { get; set; } = string.Empty;
     public int? GamesCount { get; set; }
 }
@@ -140,6 +142,16 @@ public class LanguageDto
 {
     public int LanguageId { get; set; }
     public string Name { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// 游戏平台DTO（包含商店链接）
+/// </summary>
+public class GamePlatformDto
+{
+    public int PlatformId { get; set; }
+    public string PlatformName { get; set; } = string.Empty;
+    public string? GamePlatformUrl { get; set; }
 }
 
 /// <summary>
@@ -190,5 +202,46 @@ public class UpdateGameRequestDto
     public string? Name { get; set; }
     public string? ShortDescription { get; set; }
     public string? HeaderImage { get; set; }
+}
+
+/// <summary>
+/// 更新游戏信息请求DTO
+/// </summary>
+public class UpdateGameInfoRequestDto
+{
+    public long GameId { get; set; }
+    public bool UpdateAchievement { get; set; } = false;
+}
+
+/// <summary>
+/// 更新游戏信息响应DTO
+/// </summary>
+public class UpdateGameInfoResponseDto
+{
+    public long GameId { get; set; }
+    public string GameName { get; set; } = string.Empty;
+    public bool Success { get; set; }
+    public string? Message { get; set; }
+    public bool AchievementUpdated { get; set; }
+}
+
+/// <summary>
+/// 批量更新所有Steam游戏请求DTO
+/// </summary>
+public class UpdateAllSteamGamesRequestDto
+{
+    public bool UpdateAchievement { get; set; } = false;
+}
+
+/// <summary>
+/// 批量更新所有Steam游戏响应DTO
+/// </summary>
+public class UpdateAllSteamGamesResponseDto
+{
+    public int TotalGames { get; set; }
+    public int UpdatedGames { get; set; }
+    public int FailedGames { get; set; }
+    public int UpdatedAchievements { get; set; }
+    public List<string> Errors { get; set; } = new();
 }
 

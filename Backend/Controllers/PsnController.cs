@@ -30,8 +30,15 @@ public class PsnController : ControllerBase
         _logger = logger;
     }
 
+    // 获取当前用户ID
+    private int GetCurrentUserId()
+    {
+        var userIdClaim = User.FindFirst("user_id")?.Value ?? User.FindFirst("sub")?.Value;
+        return int.TryParse(userIdClaim, out var userId) ? userId : 1;
+    }
+
     /// <summary>
-    /// 初始化平台数据
+    /// 初始化平台数据（优化版本：批量检查，减少数据库查询）
     /// </summary>
     private async Task InitializePlatformsAsync()
     {
@@ -47,49 +54,66 @@ public class PsnController : ControllerBase
             new { Id = 8, Name = "Nintendo Switch", Description = "任天堂Switch平台" }
         };
 
+        // 批量检查所有平台ID和名称，只查询一次
+        var platformIds = platforms.Select(p => p.Id).ToList();
+        var platformNames = platforms.Select(p => p.Name).ToList();
+        
+        var existingPlatforms = await _context.Platforms
+            .Where(p => platformIds.Contains(p.PlatformId) || platformNames.Contains(p.PlatformName))
+            .Select(p => new { p.PlatformId, p.PlatformName })
+            .ToListAsync();
+
+        var existingIds = existingPlatforms.Select(p => p.PlatformId).ToHashSet();
+        var existingNames = existingPlatforms.Select(p => p.PlatformName).ToHashSet();
+
+        // 只插入不存在的平台
+        var platformsToInsert = platforms
+            .Where(p => !existingIds.Contains(p.Id) && !existingNames.Contains(p.Name))
+            .ToList();
+
+        if (platformsToInsert.Count == 0)
+        {
+            return; // 所有平台都已存在，无需操作
+        }
+
         var connection = _context.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open)
         {
             await connection.OpenAsync();
         }
 
-        foreach (var platformInfo in platforms)
+        // 批量插入（使用ON DUPLICATE KEY UPDATE避免重复）
+        foreach (var platformInfo in platformsToInsert)
         {
-            var exists = await _context.Platforms
-                .AnyAsync(p => p.PlatformId == platformInfo.Id || p.PlatformName == platformInfo.Name);
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                INSERT INTO platforms (platform_id, platform_name, description, status) 
+                VALUES (@id, @name, @desc, 1)
+                ON DUPLICATE KEY UPDATE platform_name = VALUES(platform_name), description = VALUES(description)";
+            
+            var idParam = command.CreateParameter();
+            idParam.ParameterName = "@id";
+            idParam.Value = platformInfo.Id;
+            command.Parameters.Add(idParam);
 
-            if (!exists)
+            var nameParam = command.CreateParameter();
+            nameParam.ParameterName = "@name";
+            nameParam.Value = platformInfo.Name;
+            command.Parameters.Add(nameParam);
+
+            var descParam = command.CreateParameter();
+            descParam.ParameterName = "@desc";
+            descParam.Value = platformInfo.Description ?? "";
+            command.Parameters.Add(descParam);
+
+            try
             {
-                using var command = connection.CreateCommand();
-                command.CommandText = @"
-                    INSERT INTO platforms (platform_id, platform_name, description, status) 
-                    VALUES (@id, @name, @desc, 1)
-                    ON DUPLICATE KEY UPDATE platform_name = VALUES(platform_name), description = VALUES(description)";
-                
-                var idParam = command.CreateParameter();
-                idParam.ParameterName = "@id";
-                idParam.Value = platformInfo.Id;
-                command.Parameters.Add(idParam);
-
-                var nameParam = command.CreateParameter();
-                nameParam.ParameterName = "@name";
-                nameParam.Value = platformInfo.Name;
-                command.Parameters.Add(nameParam);
-
-                var descParam = command.CreateParameter();
-                descParam.ParameterName = "@desc";
-                descParam.Value = platformInfo.Description ?? "";
-                command.Parameters.Add(descParam);
-
-                try
-                {
-                    await command.ExecuteNonQueryAsync();
-                    _logger.LogInformation("创建平台: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "创建平台失败: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
-                }
+                await command.ExecuteNonQueryAsync();
+                _logger.LogInformation("创建平台: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "创建平台失败: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
             }
         }
     }
@@ -107,9 +131,10 @@ public class PsnController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("检查PSN令牌状态");
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("检查PSN令牌状态: userId={UserId}", userId);
 
-            var result = await _psnService.CheckTokenStatus();
+            var result = await _psnService.CheckTokenStatus(userId, 6);
 
             return Ok(ApiResponse<PsnAuthResponseDto>.SuccessResponse(result, 
                 result.Success ? "令牌有效" : "令牌无效或不存在"));
@@ -163,9 +188,10 @@ public class PsnController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("开始PSN认证");
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("开始PSN认证: userId={UserId}", userId);
 
-            var result = await _psnService.AuthenticatePsn(request);
+            var result = await _psnService.AuthenticatePsn(request, userId);
 
             if (!result.Success)
             {
@@ -221,14 +247,14 @@ public class PsnController : ControllerBase
                 return BadRequest(ApiResponse<object>.ErrorResponse("BAD_REQUEST", $"用户ID {request.UserId} 不存在,请先创建用户"));
             }
 
-            var userId = request.UserId;
+            var userId = (int)request.UserId;
             _logger.LogInformation("导入PSN数据: userId={UserId}, psnOnlineId={OnlineId}", userId, request.PsnOnlineId);
 
             // 初始化平台数据
             await InitializePlatformsAsync();
 
             // 获取PSN用户信息
-            var psnUser = await _psnService.GetPsnUser(request.PsnOnlineId);
+            var psnUser = await _psnService.GetPsnUser(request.PsnOnlineId, userId);
             if (psnUser == null)
             {
                 return BadRequest(ApiResponse<PsnImportResponseDto>.ErrorResponse("ERR_PSN_USER_NOT_FOUND", "PSN用户不存在或令牌无效,请先进行认证"));
@@ -267,7 +293,7 @@ public class PsnController : ControllerBase
             {
                 userPlatformBinding = new UserPlatformBinding
                 {
-                    UserId = userId,
+                    UserId = (int)userId,
                     PlatformId = PSN_PLATFORM_ID,
                     PlatformUserId = psnUser.OnlineId,
                     BindingStatus = true,
@@ -279,9 +305,12 @@ public class PsnController : ControllerBase
             }
             else
             {
+                // 更新绑定时，更新绑定时间和同步时间
                 userPlatformBinding.PlatformUserId = psnUser.OnlineId;
                 userPlatformBinding.BindingStatus = true;
-                userPlatformBinding.LastSyncTime = DateTime.UtcNow;
+                userPlatformBinding.BindingTime = DateTime.UtcNow; // 更新绑定时间
+                userPlatformBinding.LastSyncTime = DateTime.UtcNow; // 更新同步时间
+                userPlatformBinding.ExpireTime = DateTime.UtcNow.AddYears(1); // 更新过期时间
             }
             await _context.SaveChangesAsync();
 
@@ -296,16 +325,17 @@ public class PsnController : ControllerBase
                     // 获取完整的PSN游戏数据
                     _logger.LogInformation("开始导入PSN游戏数据...");
                     
-                    var psnGames = await _psnService.GetPsnUserGames(request.PsnOnlineId);
+                    var psnGames = await _psnService.GetPsnUserGames(request.PsnOnlineId, userId);
                     
                     foreach (var psnGame in psnGames)
                     {
                         try
                         {
-                            // 查找或创建游戏
-                            var game = await _context.Games
+                            // 先通过游戏名称查找是否已存在同名游戏（不同平台的同名游戏共享同一个game_id）
+                            Game? game = await _context.Games
                                 .FirstOrDefaultAsync(g => g.Name == psnGame.Name);
 
+                            // 如果游戏不存在，创建新游戏
                             if (game == null)
                             {
                                 // 创建新游戏
@@ -368,8 +398,11 @@ public class PsnController : ControllerBase
                                 }
                             }
 
-                            // 创建或更新游戏平台映射
-                            if (!await _context.GamePlatforms.AnyAsync(gp => gp.GameId == game.GameId && gp.PlatformId == PSN_PLATFORM_ID))
+                            // 创建或更新游戏平台映射（如果该平台映射不存在）
+                            var gamePlatform = await _context.GamePlatforms
+                                .FirstOrDefaultAsync(gp => gp.GameId == game.GameId && gp.PlatformId == PSN_PLATFORM_ID);
+                            
+                            if (gamePlatform == null)
                             {
                                 _context.GamePlatforms.Add(new GamePlatform
                                 {
@@ -378,6 +411,14 @@ public class PsnController : ControllerBase
                                     PlatformGameId = psnGame.TitleId,
                                     GamePlatformUrl = $"https://store.playstation.com/concept/{psnGame.TitleId}"
                                 });
+                                await _context.SaveChangesAsync();
+                            }
+                            else if (gamePlatform.PlatformGameId != psnGame.TitleId)
+                            {
+                                // 更新平台游戏ID（如果不同）
+                                gamePlatform.PlatformGameId = psnGame.TitleId;
+                                gamePlatform.GamePlatformUrl = $"https://store.playstation.com/concept/{psnGame.TitleId}";
+                                await _context.SaveChangesAsync();
                             }
 
                             // 创建或更新用户平台游戏库记录
@@ -424,6 +465,14 @@ public class PsnController : ControllerBase
                     }
                     
                     _logger.LogInformation("成功导入 {Count} 个PSN游戏", gamesCount);
+                    
+                    // 导入完成后，更新LastSyncTime
+                    if (userPlatformBinding != null)
+                    {
+                        userPlatformBinding.LastSyncTime = DateTime.UtcNow;
+                        await _context.SaveChangesAsync();
+                        _logger.LogInformation("已更新LastSyncTime: {LastSyncTime}", userPlatformBinding.LastSyncTime);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -464,9 +513,10 @@ public class PsnController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("获取PSN用户信息: onlineId={OnlineId}", onlineId);
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("获取PSN用户信息: onlineId={OnlineId}, userId={UserId}", onlineId, userId);
 
-            var result = await _psnService.GetPsnUser(onlineId);
+            var result = await _psnService.GetPsnUser(onlineId, userId);
 
             if (result == null)
             {
@@ -493,9 +543,10 @@ public class PsnController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("获取PSN游戏信息: titleId={TitleId}", titleId);
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("获取PSN游戏信息: titleId={TitleId}, userId={UserId}", titleId, userId);
 
-            var result = await _psnService.GetPsnGame(titleId);
+            var result = await _psnService.GetPsnGame(titleId, userId);
 
             if (result == null)
             {
@@ -521,9 +572,10 @@ public class PsnController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("获取PSN用户奖杯: onlineId={OnlineId}", onlineId);
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("获取PSN用户奖杯: onlineId={OnlineId}, userId={UserId}", onlineId, userId);
 
-            var result = await _psnService.GetPsnUserTrophies(onlineId);
+            var result = await _psnService.GetPsnUserTrophies(onlineId, userId);
 
             return Ok(ApiResponse<PsnUserTrophiesResponseDto>.SuccessResponse(result));
         }

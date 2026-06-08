@@ -1,0 +1,501 @@
+classDiagram
+    direction TB
+    
+    class PlayLinkerDbContext {
+        +DbSet~User~ Users
+        +DbSet~Game~ Games
+        +DbSet~UserPlatformBinding~ UserPlatformBindings
+        +DbSet~UserPlatformLibrary~ UserPlatformLibraries
+        +DbSet~Achievement~ Achievements
+        +DbSet~News~ News
+        +DbSet~PriceHistory~ PriceHistories
+        +DbSet~ParentalControlRelationship~ ParentalControlRelationships
+        +DbSet~ReportGenerationRecord~ ReportGenerationRecords
+        +DbSet~Recommendation~ Recommendations
+        +DbSet~LocalGameInstall~ LocalGameInstalls
+        +SaveChanges()
+    }
+
+    namespace AuthAndDataAccess {
+        class AuthController {
+            +Login()
+            +Register()
+        }
+        class UsersController {
+            +GetUserProfile()
+        }
+        class SteamController {
+            +ImportSteamData()
+        }
+        class EpicController {
+            +ImportEpicData()
+        }
+        class XboxController {
+            +ImportXboxData()
+        }
+        class PsnController {
+            +ImportPsnData()
+        }
+        class GogController {
+            +ImportGogData()
+        }
+        class PlatformsController {
+            +GetPlatforms()
+            +BindPlatform()
+        }
+        class AuthService {
+            +AuthenticateUser()
+            +GenerateToken()
+        }
+        class SteamService {
+            +FetchSteamData()
+        }
+        class XboxService {
+            +FetchXboxData()
+        }
+        class GogService {
+            +FetchGogData()
+        }
+        class PsnService {
+            +FetchPsnData()
+        }
+        class EpicService {
+            +FetchEpicData()
+        }
+        class User {
+            +int UserId
+            +string Username
+            +string Email
+        }
+        class UserPlatformBinding {
+            +int Id
+            +int UserId
+            +int PlatformId
+            +string PlatformUserId
+        }
+        class Platform {
+            +int PlatformId
+            +string PlatformName
+        }
+        class PlayerPlatform {
+            +string PlatformUserId
+            +int PlatformId
+        }
+    }
+
+    namespace UnifiedLibrary {
+        class LibraryController {
+            +GetLibraryOverview()
+            +GetUserGames()
+            +SyncPlatformData()
+        }
+        class GamesController {
+            +GetGames()
+            +GetGameDetail()
+            +SearchGames()
+        }
+        class MetadataController {
+            +GetGenres()
+            +GetDevelopers()
+            +GetPublishers()
+        }
+        class Game {
+            +long GameId
+            +string Name
+            +string Description
+            +string HeaderImage
+        }
+        class UserPlatformLibrary {
+            +string PlatformUserId
+            +int PlatformId
+            +long GameId
+            +int PlaytimeMinutes
+        }
+        class Genre {
+            +int GenreId
+            +string Name
+        }
+        class Developer {
+            +int DeveloperId
+            +string Name
+        }
+        class Publisher {
+            +int PublisherId
+            +string Name
+        }
+        class GameRanking {
+            +long GameId
+            +int CurrentRank
+        }
+    }
+
+    namespace GameDetailAndExtensions {
+        class AchievementsController {
+            +GetGameAchievements()
+            +GetUserAchievements()
+            +SyncAchievements()
+        }
+        class NewsController {
+            +GetNews()
+            +GetGameNews()
+        }
+        class Achievement {
+            +string AchievementId
+            +long GameId
+            +string DisplayName
+            +string Description
+        }
+        class News {
+            +long NewsId
+            +string Title
+            +string Content
+            +DateTime Date
+        }
+        class UserAchievement {
+            +int Id
+            +int UserId
+            +string AchievementId
+            +bool Unlocked
+        }
+        class GameNews {
+            +long GameId
+            +long NewsId
+        }
+    }
+
+    namespace LocalFileAndMod {
+        class LocalGamesController {
+            +ScanLocalGames()
+            +GetLocalGames()
+            +DeleteGame()
+        }
+        class SavesController {
+            +GetLocalSaves()
+            +BackupSave()
+            +RestoreSave()
+        }
+        class ModsController {
+            +GetMods()
+            +InstallMod()
+            +ToggleMod()
+        }
+        class ModExploreController {
+            +SearchMods()
+            +GetModDetails()
+        }
+        class CloudController {
+            +GetCloudSaves()
+            +UploadToCloud()
+            +DownloadFromCloud()
+        }
+        class ModExploreService {
+            +SearchNexusMods()
+            +SearchGameBanana()
+        }
+        class AliyunOssService {
+            +UploadFile()
+            +DownloadFile()
+        }
+        class LocalGameInstall {
+            +long Id
+            +int UserId
+            +string InstallPath
+            +string ExePath
+        }
+        class LocalMod {
+            +long Id
+            +long LocalGameId
+            +string ModName
+            +bool IsEnabled
+        }
+        class LocalSaveFile {
+            +long Id
+            +long LocalGameId
+            +string SavePath
+            +DateTime BackupDate
+        }
+        class CloudSaveBackup {
+            +long Id
+            +int UserId
+            +long LocalGameId
+            +string FileUrl
+        }
+        class GameModSource {
+            +int SourceId
+            +string SourceName
+            +string ApiUrl
+        }
+    }
+
+    namespace DataVisAndReporting {
+        class UserReportController {
+            +GetReportOverview()
+            +GetPlaytimeTrends()
+        }
+        class ReportsController {
+            +GenerateReport()
+            +GetReportHistory()
+            +DownloadReport()
+        }
+        class UserReportService {
+            +GetUserProfileSummary()
+            +GetGameLibrarySummary()
+            +GetPlaytimeTrends()
+        }
+        class ReportGenerationService {
+            +GeneratePdfReport()
+            +GenerateHtmlReport()
+            +GenerateCsvReport()
+        }
+        class ReportGenerationRecord {
+            +long Id
+            +int UserId
+            +string ReportType
+            +string FilePath
+            +DateTime CreatedAt
+        }
+        class ReportTemplate {
+            +int TemplateId
+            +string TemplateName
+            +string TemplateContent
+        }
+    }
+
+    namespace RecommendationAndAnalytics {
+        class RecommendationsController {
+            +GetRecommendations()
+            +SubmitFeedback()
+        }
+        class AnalyticsController {
+            +GetPlaytimeAnalytics()
+            +GetGenrePreferences()
+            +GetPlatformDistribution()
+        }
+        class AiService {
+            +AnalyzeUserPreferencesAsync()
+            +GetRecommendationsAsync()
+            +PredictPriceAsync()
+        }
+        class Recommendation {
+            +long Id
+            +int UserId
+            +long GameId
+            +double Score
+            +string Reason
+        }
+        class RecommendationFeedback {
+            +long Id
+            +long RecommendationId
+            +int FeedbackType
+        }
+        class UserPlaytimeHistory {
+            +long Id
+            +int UserId
+            +long GameId
+            +DateTime RecordDate
+            +int PlaytimeMinutes
+        }
+        class UserPreference {
+            +int Id
+            +int UserId
+            +string PreferenceKey
+            +string PreferenceValue
+        }
+        class PreferenceGenre {
+            +int Id
+            +int UserId
+            +int GenreId
+            +double Weight
+        }
+    }
+
+    namespace PriceMonitor {
+        class PricesController {
+            +GetPriceHistory()
+            +GetPriceAlerts()
+            +SubscribePriceAlert()
+        }
+        class WishlistController {
+            +GetWishlist()
+            +AddToWishlist()
+            +RemoveFromWishlist()
+        }
+        class SalesController {
+            +GetSales()
+            +GetGameSales()
+        }
+        class AlertsController {
+            +GetAlerts()
+            +MarkAlertAsRead()
+        }
+        class PriceMonitoringService {
+            +CheckPriceChanges()
+            +SendPriceAlerts()
+        }
+        class PriceHistory {
+            +long Id
+            +long GameId
+            +decimal Price
+            +DateTime RecordDate
+        }
+        class PriceAlertSubscription {
+            +long Id
+            +int UserId
+            +long GameId
+            +decimal TargetPrice
+        }
+        class PriceAlertLog {
+            +long Id
+            +long SubscriptionId
+            +DateTime AlertTime
+        }
+    }
+
+    namespace ParentalAndNotification {
+        class ParentalController {
+            +GetChildren()
+            +SetTimeLimit()
+            +CreateInvitation()
+            +RespondInvitation()
+        }
+        class NotificationsController {
+            +GetNotifications()
+            +MarkAsRead()
+            +DeleteNotification()
+        }
+        class ParentalMonitoringService {
+            +CheckTimeLimits()
+            +SendWeeklyReports()
+        }
+        class EmailService {
+            +SendEmail()
+            +SendWeeklyReport()
+        }
+        class ParentalControlRelationship {
+            +int Id
+            +int ParentUserId
+            +int ChildUserId
+        }
+        class ParentalControlRule {
+            +int Id
+            +int RelationshipId
+            +string RuleType
+            +string RuleValue
+        }
+        class ParentalAlertLog {
+            +long Id
+            +int RelationshipId
+            +string AlertType
+            +DateTime AlertTime
+        }
+        class NotificationCenter {
+            +long Id
+            +int UserId
+            +string Title
+            +string Message
+            +bool IsRead
+            +DateTime CreatedAt
+        }
+    }
+
+    %% Core Database Context Relationships
+    PlayLinkerDbContext --> User
+    PlayLinkerDbContext --> Game
+    PlayLinkerDbContext --> UserPlatformBinding
+    PlayLinkerDbContext --> UserPlatformLibrary
+    PlayLinkerDbContext --> Achievement
+    PlayLinkerDbContext --> News
+    PlayLinkerDbContext --> PriceHistory
+    PlayLinkerDbContext --> ParentalControlRelationship
+    PlayLinkerDbContext --> ReportGenerationRecord
+    PlayLinkerDbContext --> Recommendation
+    PlayLinkerDbContext --> LocalGameInstall
+
+    %% Auth and Data Access Module
+    AuthController --> AuthService
+    AuthController --> PlayLinkerDbContext
+    UsersController --> PlayLinkerDbContext
+    SteamController --> SteamService
+    EpicController --> EpicService
+    XboxController --> XboxService
+    PsnController --> PsnService
+    GogController --> GogService
+    PlatformsController --> PlayLinkerDbContext
+    UserPlatformBinding --> User
+    UserPlatformBinding --> Platform
+    PlayerPlatform --> Platform
+
+    %% Unified Library Module
+    LibraryController --> PlayLinkerDbContext
+    GamesController --> PlayLinkerDbContext
+    MetadataController --> PlayLinkerDbContext
+    UserPlatformLibrary --> Game
+    UserPlatformLibrary --> PlayerPlatform
+    GameRanking --> Game
+
+    %% Game Detail and Extensions Module
+    AchievementsController --> PlayLinkerDbContext
+    NewsController --> PlayLinkerDbContext
+    UserAchievement --> User
+    UserAchievement --> Achievement
+    Achievement --> Game
+    GameNews --> Game
+    GameNews --> News
+
+    %% Local File and Mod Module
+    LocalGamesController --> PlayLinkerDbContext
+    SavesController --> PlayLinkerDbContext
+    ModsController --> PlayLinkerDbContext
+    ModExploreController --> ModExploreService
+    CloudController --> AliyunOssService
+    CloudController --> PlayLinkerDbContext
+    LocalGameInstall --> User
+    LocalMod --> LocalGameInstall
+    LocalSaveFile --> LocalGameInstall
+    CloudSaveBackup --> User
+    CloudSaveBackup --> LocalGameInstall
+
+    %% Data Visualization and Reporting Module
+    UserReportController --> UserReportService
+    UserReportController --> ReportGenerationService
+    ReportsController --> ReportGenerationService
+    ReportsController --> PlayLinkerDbContext
+    UserReportService --> PlayLinkerDbContext
+    ReportGenerationService --> PlayLinkerDbContext
+    ReportGenerationRecord --> User
+    ReportTemplate --> ReportGenerationRecord
+
+    %% Recommendation and Analytics Module
+    RecommendationsController --> AiService
+    RecommendationsController --> PlayLinkerDbContext
+    AnalyticsController --> PlayLinkerDbContext
+    Recommendation --> User
+    Recommendation --> Game
+    RecommendationFeedback --> Recommendation
+    UserPlaytimeHistory --> User
+    UserPlaytimeHistory --> Game
+    UserPreference --> User
+    PreferenceGenre --> User
+    PreferenceGenre --> Genre
+
+    %% Price Monitor Module
+    PricesController --> PlayLinkerDbContext
+    PricesController --> AiService
+    WishlistController --> PlayLinkerDbContext
+    SalesController --> PlayLinkerDbContext
+    AlertsController --> PlayLinkerDbContext
+    PriceMonitoringService --> PlayLinkerDbContext
+    PriceHistory --> Game
+    PriceAlertSubscription --> User
+    PriceAlertSubscription --> Game
+    PriceAlertLog --> PriceAlertSubscription
+
+    %% Parental and Notification Module
+    ParentalController --> PlayLinkerDbContext
+    NotificationsController --> PlayLinkerDbContext
+    ParentalMonitoringService --> PlayLinkerDbContext
+    ParentalMonitoringService --> EmailService
+    ParentalControlRelationship --> User
+    ParentalControlRule --> ParentalControlRelationship
+    ParentalAlertLog --> ParentalControlRelationship
+    NotificationCenter --> User

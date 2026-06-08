@@ -4,10 +4,8 @@
 
 PlayLinker是一个统一游戏管理平台,旨在整合多个游戏平台(Steam、Epic Games、Origin等)的游戏库,为玩家提供一站式的游戏管理体验。
 
-**开发者**: 开发者B  
-**负责模块**: 游戏数据、游戏元数据、游戏库管理、成就系统、Steam集成  
-**开发周期**: 2周  
-**最后更新**: 2024-11-27
+**当前版本**: v2.0.0  
+**状态**: ✅ 核心功能已完成
 
 ---
 
@@ -19,6 +17,8 @@ PlayLinker是一个统一游戏管理平台,旨在整合多个游戏平台(Steam
 - **ORM**: Entity Framework Core 8.0
 - **认证**: JWT Bearer Token
 - **API文档**: Swagger UI
+- **PDF生成**: QuestPDF
+- **日志**: ILogger (ASP.NET Core)
 
 ### 前端
 - **框架**: Vue 3
@@ -40,7 +40,18 @@ PlayLinker/
 │   │   ├── LibraryController.cs         # 游戏库管理API
 │   │   ├── AchievementsController.cs    # 成就系统API
 │   │   ├── NewsController.cs            # 新闻资讯API
-│   │   └── SteamController.cs           # Steam集成API
+│   │   ├── SteamController.cs           # Steam集成API
+│   │   ├── XboxController.cs            # Xbox集成API
+│   │   ├── PsnController.cs             # PSN集成API
+│   │   ├── GogController.cs             # GOG集成API
+│   │   ├── LocalGamesController.cs      # 本地游戏管理API
+│   │   ├── SavesController.cs           # 存档管理API
+│   │   ├── CloudController.cs           # 云存档管理API
+│   │   ├── ModsController.cs            # Mod管理API
+│   │   ├── ReportsController.cs         # 报表系统API
+│   │   ├── AnalyticsController.cs       # 数据分析API
+│   │   ├── WishlistController.cs        # 愿望单API
+│   │   └── PreferencesController.cs     # 用户偏好API
 │   ├── Models/                   # 数据模型
 │   │   ├── Entities/             # 数据库实体类
 │   │   │   ├── Game.cs
@@ -56,7 +67,8 @@ PlayLinker/
 │   │   └── ApiResponse.cs        # 统一响应格式
 │   ├── Services/                 # 业务逻辑服务
 │   │   ├── ISteamService.cs
-│   │   └── SteamService.cs
+│   │   ├── SteamService.cs
+│   │   └── ReportGenerationService.cs
 │   ├── Data/                     # 数据访问层
 │   │   └── PlayLinkerDbContext.cs
 │   ├── Program.cs                # 程序入口
@@ -312,7 +324,55 @@ http://localhost:5000/api/v1
 - `GET /api/v1/gog/user/{gogUserId}` - 获取GOG用户信息
 - `GET /api/v1/gog/games/{gogGameId}` - 获取GOG游戏信息
 
+#### 本地游戏管理API(需认证)
+- `POST /api/v1/local-games/scan` - 扫描本地游戏
+- `GET /api/v1/local-games` - 获取本地游戏列表
+- `GET /api/v1/local-games/{id}` - 获取本地游戏详情
+- `DELETE /api/v1/local-games/{id}` - 删除本地游戏
+- `PUT /api/v1/local-games/{id}/path` - 更新游戏路径
+
+#### 存档管理API(需认证)
+- `GET /api/v1/saves/local` - 获取本地存档列表
+- `POST /api/v1/saves/backup` - 备份存档
+- `POST /api/v1/saves/restore/{id}` - 恢复存档
+- `DELETE /api/v1/saves/{id}` - 删除存档
+
+#### 云存档管理API(需认证)
+- `GET /api/v1/cloud` - 获取云存档列表
+- `POST /api/v1/cloud/upload` - 上传存档到云端
+- `POST /api/v1/cloud/download` - 从云端下载存档
+- `DELETE /api/v1/cloud/{id}` - 删除云存档
+
+#### Mod管理API(需认证)
+- `POST /api/v1/mods/install` - 安装Mod(网页版手动安装指导)
+- `PUT /api/v1/mods/{id}/toggle` - 启用/禁用Mod
+- `POST /api/v1/mods/{id}/confirm-install` - 确认手动安装完成
+- `DELETE /api/v1/mods/{id}` - 卸载Mod
+- `GET /api/v1/mods/conflicts` - 检测Mod冲突
+
+#### 报表系统API(需认证)
+- `GET /api/v1/reports/templates` - 获取报表模板列表
+- `POST /api/v1/reports/generate` - 生成报表
+- `GET /api/v1/reports` - 获取报表历史
+- `GET /api/v1/reports/{id}` - 获取报表详情
+- `GET /api/v1/reports/{id}/download` - 下载报表(支持HTML/CSV/PDF)
+- `DELETE /api/v1/reports/{id}` - 删除报表
+
+#### 数据分析API(需认证)
+- `GET /api/v1/analytics/playtime` - 游玩时间分析
+- `GET /api/v1/analytics/genres` - 题材偏好分析
+- `GET /api/v1/analytics/platforms` - 平台分布分析
+- `GET /api/v1/analytics/achievements` - 成就统计分析
+- `GET /api/v1/analytics/spending` - 消费分析(无数据提示)
+
+#### 愿望单API(需认证)
+- `GET /api/v1/wishlist` - 获取愿望单列表
+- `POST /api/v1/wishlist` - 添加到愿望单
+- `DELETE /api/v1/wishlist/{id}` - 从愿望单移除
+
 **详细文档**:
+- [游戏数据与平台 API文档](任务文档/API_Developer_B.md)
+- [本地文件与数据分析 API文档](任务文档/API_Developer_C.md)
 - [Steam集成文档](Backend/README.md)
 - [Xbox集成文档](Backend/XBOX_INTEGRATION.md)
 - [PSN集成文档](Backend/PSN_INTEGRATION.md)
@@ -616,6 +676,7 @@ curl http://localhost:5000/api/v1/library/overview
 - ✅ 游戏搜索功能
 - ✅ 游戏排行榜
 - ✅ 游戏CRUD操作(管理员)
+- ✅ 游戏Mod列表查询
 
 #### 游戏元数据
 - ✅ 题材(Genre)管理
@@ -641,11 +702,65 @@ curl http://localhost:5000/api/v1/library/overview
 - ✅ 新闻详情
 - ✅ 游戏相关新闻
 
-#### Steam集成
+#### 平台集成
 - ✅ Steam数据导入接口
 - ✅ Steam用户信息查询
 - ✅ Steam游戏信息查询
-- ✅ 对接Steam Web API
+- ✅ Xbox认证与数据导入
+- ✅ PSN认证与数据导入
+- ✅ GOG认证与数据导入
+- ✅ 对接多平台Web API
+
+#### 本地游戏管理
+- ✅ 本地游戏扫描(网页版文件上传方式)
+- ✅ 本地游戏列表(分页、排序、筛选)
+- ✅ 本地游戏详情(含存档和Mod信息)
+- ✅ 游戏路径更新
+- ✅ 游戏删除(仅删除记录)
+
+#### 存档管理
+- ✅ 本地存档列表查询
+- ✅ 存档备份(模拟实现)
+- ✅ 存档恢复(模拟实现)
+- ✅ 存档删除
+- ✅ 存档汇总统计
+
+#### 云存档管理
+- ✅ 云存档列表(分页、汇总)
+- ✅ 上传存档到云端(模拟实现)
+- ✅ 从云端下载存档(模拟实现)
+- ✅ 云存档删除
+- ✅ 存储空间统计
+
+#### Mod管理
+- ✅ Mod安装(网页版手动安装指导)
+- ✅ Mod启用/禁用
+- ✅ 确认手动安装完成
+- ✅ Mod卸载
+- ✅ Mod冲突检测(简化实现)
+
+#### 报表系统
+- ✅ 报表模板管理
+- ✅ 报表生成(异步任务)
+- ✅ 报表历史记录
+- ✅ 报表详情查询
+- ✅ 报表下载(HTML/CSV/PDF三种格式)
+- ✅ 报表删除
+- ✅ QuestPDF专业PDF生成
+
+#### 数据分析
+- ✅ 游玩时间分析(真实数据)
+- ✅ 题材偏好分析(真实数据)
+- ✅ 平台分布分析(真实数据)
+- ✅ 成就统计分析(真实数据)
+- ✅ 消费分析(无数据提示)
+
+#### 愿望单与价格监控
+- ✅ 愿望单列表查询
+- ✅ 添加到愿望单
+- ✅ 从愿望单移除
+- ✅ 价格历史记录
+- ✅ 价格提醒订阅
 
 #### 前端界面
 - ✅ 游戏列表页面
@@ -659,13 +774,15 @@ curl http://localhost:5000/api/v1/library/overview
 
 #### 技术特性
 - ✅ RESTful API设计
-- ✅ Swagger API文档
+- ✅ Swagger API文档(完整标注)
 - ✅ JWT认证机制
 - ✅ 统一响应格式
-- ✅ 错误处理和日志记录
+- ✅ 完善的错误处理和日志记录
 - ✅ CORS跨域支持
 - ✅ Entity Framework Code First
-- ✅ 数据库关系映射
+- ✅ 复杂数据库关系映射
+- ✅ 网页版功能限制的优雅处理
+- ✅ 分页、排序、筛选通用实现
 
 ### 待实现功能 📋
 
@@ -705,40 +822,20 @@ curl http://localhost:5000/api/v1/library/overview
 
 ---
 
-## 开发进度
+## 模块文档
 
-### 第1周完成情况
+### 后端 API 文档
 
-✅ **Day 1-2**: 项目初始化与游戏数据
-- 完成项目结构搭建
-- 完成Entity Framework配置
-- 实现游戏列表、详情、搜索接口
-- 编写单元测试(控制器逻辑)
+| 模块 | 功能范围 | 详细文档 |
+|------|----------|----------|
+| 用户认证与监管 | 用户认证、用户管理、通知中心、家长监管 | [API_Developer_A.md](任务文档/API_Developer_A.md) |
+| 游戏数据与平台 | 游戏数据、游戏库管理、成就系统、Steam集成 | [API_Developer_B.md](任务文档/API_Developer_B.md) |
+| 本地文件与数据 | 本地文件管理、存档管理、Mod管理、报表系统 | [API_Developer_C.md](任务文档/API_Developer_C.md) |
+| 用户偏好与推荐 | 用户偏好、推荐系统、价格监控、愿望单 | [API_Developer_D.md](任务文档/API_Developer_D.md) |
 
-✅ **Day 3-4**: 游戏库与Steam集成
-- 完成Steam API客户端开发
-- 实现游戏库概览接口
-- 实现用户游戏列表接口
-- 实现同步平台数据接口
-- 实现Steam数据导入接口
-- 实现Steam用户信息查询
+### 前端开发指南
 
-### 第2周完成情况
-
-✅ **Day 5**: 成就系统
-- 实现游戏成就列表接口
-- 实现用户成就总览接口
-- 实现用户游戏成就接口
-- 实现成就同步接口
-
-✅ **Day 6-7**: 元数据、新闻与前端
-- 完成题材/分类/开发商/发行商接口
-- 实现新闻列表和详情接口
-- 实现游戏新闻接口
-- 完成游戏排行榜接口
-- 创建Vue.js前端项目
-- 实现所有主要页面组件
-- 集成前后端交互
+详见：[前端开发指南](任务文档/FRONTEND_DEVELOPMENT_GUIDE.md)
 
 ---
 
@@ -850,17 +947,22 @@ curl http://localhost:5000/api/v1/library/overview
 
 ---
 
-## 联系方式
-
-- **项目负责人**: 开发者B
-- **邮箱**: developer@playlinker.com
-- **问题反馈**: 请在GitHub Issues中提交
-
 ---
 
-**最后更新**: 2024-12-08  
-**版本**: v1.0.0  
-**状态**: 开发中 🚧
+## 项目统计
+
+### 代码规模
+- **API端点**: 60+ 个
+- **数据库表**: 40+ 张
+- **实体类**: 35+ 个
+- **DTO类**: 50+ 个
+- **控制器**: 20+ 个
+
+### 功能模块
+- ✅ **用户认证与监管**: 用户认证、通知中心、家长监管
+- ✅ **游戏数据与平台**: 游戏数据与平台集成
+- ✅ **本地文件与数据**: 本地文件与数据分析
+- ✅ **用户偏好与推荐**: 用户偏好与推荐
 
 ---
 
@@ -875,6 +977,4 @@ curl http://localhost:5000/api/v1/library/overview
 - PSN API (psn-api)
 - GOG API
 - MySQL数据库
-
-PlayLinker © 2024
 

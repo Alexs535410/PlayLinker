@@ -70,9 +70,9 @@ class XboxDataCollector:
                 "message": f"令牌刷新失败: {str(e)}"
             }
 
-        # 保存刷新后的令牌
+        # 保存刷新后的令牌（使用Pydantic V2的新方法）
         with open(self.tokens_file, mode="w", encoding="utf-8") as f:
-            f.write(self.auth_mgr.oauth.json())
+            f.write(self.auth_mgr.oauth.model_dump_json())
 
         # 创建 Xbox API 客户端
         self.xbl_client = XboxLiveClient(self.auth_mgr)
@@ -176,7 +176,7 @@ class XboxDataCollector:
         except Exception as e:
             return {"error": str(e)}
 
-    async def get_title_history(self, xuid=None, max_items=50):
+    async def get_title_history(self, xuid=None, max_items=1000):
         """获取游戏活动历史"""
         try:
             from xbox.webapi.api.provider.titlehub.models import TitleFields
@@ -192,9 +192,20 @@ class XboxDataCollector:
                 TitleFields.GAME_PASS,
             ]
 
+            print(f"INFO: 开始获取游戏历史，XUID={target_xuid}, max_items={max_items}", flush=True)
             title_history = await self.xbl_client.titlehub.get_title_history(
                 target_xuid, max_items=max_items, fields=fields
             )
+            
+            if not title_history:
+                print("WARNING: title_history为空", flush=True)
+                return {"xuid": target_xuid, "titles": []}
+            
+            if not title_history.titles:
+                print("WARNING: title_history.titles为空", flush=True)
+                return {"xuid": target_xuid, "titles": []}
+            
+            print(f"INFO: 获取到 {len(title_history.titles)} 个游戏", flush=True)
 
             titles_data = {
                 "xuid": target_xuid,
@@ -300,9 +311,89 @@ class XboxDataCollector:
 
                     titles_data["titles"].append(title_info)
 
+            print(f"INFO: 成功处理 {len(titles_data['titles'])} 个游戏", flush=True)
             return titles_data
         except Exception as e:
-            return {"error": str(e)}
+            import traceback
+            error_msg = f"获取游戏历史失败: {str(e)}\n{traceback.format_exc()}"
+            print(f"ERROR: {error_msg}", flush=True)
+            return {"error": str(e), "xuid": target_xuid if 'target_xuid' in locals() else None, "titles": []}
+
+    async def get_game_achievements(self, xuid, title_id, service_config_id=None):
+        """获取指定游戏的详细成就信息"""
+        try:
+            print(f"INFO: 开始获取游戏成就: xuid={xuid}, title_id={title_id}, service_config_id={service_config_id}", flush=True)
+            
+            # 获取Xbox One游戏的成就进度（包含所有成就列表和玩家解锁状态）
+            achievements = await self.xbl_client.achievements.get_achievements_xboxone_gameprogress(
+                xuid, title_id
+            )
+            
+            achievements_data = {
+                "title_id": title_id,
+                "service_config_id": service_config_id,
+                "achievements": []
+            }
+            
+            if achievements.achievements:
+                print(f"INFO: 获取到 {len(achievements.achievements)} 个成就", flush=True)
+                for ach in achievements.achievements:
+                    # 获取图标URL
+                    icon_unlocked = ""
+                    icon_locked = ""
+                    if ach.media_assets:
+                        for media in ach.media_assets:
+                            if media.name == "Icon" or media.name == "UnlockedIcon":
+                                icon_unlocked = media.url
+                            elif media.name == "LockedIcon":
+                                icon_locked = media.url
+                    
+                    # 如果没有找到解锁图标，尝试使用第一个媒体资源
+                    if not icon_unlocked and ach.media_assets:
+                        icon_unlocked = ach.media_assets[0].url
+                    
+                    # 获取Gamerscore
+                    gamerscore = 0
+                    if ach.progression and ach.progression.rewards:
+                        for reward in ach.progression.rewards:
+                            if reward.name == "Gamerscore":
+                                try:
+                                    gamerscore = int(reward.value)
+                                except (ValueError, TypeError):
+                                    pass
+                                break
+                    
+                    # 判断是否已解锁
+                    is_unlocked = ach.progress_state == "Achieved"
+                    
+                    # 获取解锁时间
+                    unlock_time = None
+                    if ach.progression and ach.progression.time_unlocked:
+                        unlock_time = ach.progression.time_unlocked.isoformat() if hasattr(ach.progression.time_unlocked, "isoformat") else str(ach.progression.time_unlocked)
+                    
+                    ach_info = {
+                        "id": ach.id,
+                        "name": ach.name,
+                        "description": ach.description or "",
+                        "locked_description": ach.locked_description or "",
+                        "progress_state": ach.progress_state,  # "Achieved" 或 "NotStarted" 或 "InProgress"
+                        "is_secret": ach.is_secret,
+                        "is_unlocked": is_unlocked,
+                        "unlock_time": unlock_time,
+                        "gamerscore": gamerscore,
+                        "icon_unlocked": icon_unlocked,
+                        "icon_locked": icon_locked if icon_locked else icon_unlocked,  # 如果没有锁定图标，使用解锁图标
+                    }
+                    achievements_data["achievements"].append(ach_info)
+            else:
+                print(f"WARNING: 游戏 {title_id} 没有成就数据", flush=True)
+            
+            return achievements_data
+        except Exception as e:
+            import traceback
+            error_msg = f"获取游戏成就失败: {str(e)}\n{traceback.format_exc()}"
+            print(f"ERROR: {error_msg}", flush=True)
+            return {"error": str(e), "title_id": title_id, "service_config_id": service_config_id, "achievements": []}
 
     async def collect_all_data(self):
         """收集所有数据"""
@@ -311,8 +402,19 @@ class XboxDataCollector:
             "xuid": self.xbl_client.xuid,
             "profile": await self.get_own_profile(),
             "presence": await self.get_own_presence(),
-            "title_history": await self.get_title_history(),
+            "title_history": None,
         }
+        
+        # 获取游戏历史，即使失败也继续
+        try:
+            title_history = await self.get_title_history()
+            all_data["title_history"] = title_history
+            if isinstance(title_history, dict) and "error" in title_history:
+                print(f"WARNING: 获取游戏历史时出现错误: {title_history.get('error')}", flush=True)
+        except Exception as e:
+            print(f"ERROR: 获取游戏历史时发生异常: {str(e)}", flush=True)
+            all_data["title_history"] = {"error": str(e), "xuid": self.xbl_client.xuid, "titles": []}
+        
         return all_data
 
 

@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.IdentityModel.Tokens;
 using PlayLinker.Models;
+using PlayLinker.Models.DTOs;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
@@ -25,7 +26,7 @@ public class AuthController : ControllerBase
     }
 
     /// <summary>
-    /// 生成测试用JWT Token (仅用于开发和测试)
+    /// 生成测试用JWT Token
     /// </summary>
     /// <param name="request">Token生成请求</param>
     [HttpPost("token")]
@@ -95,7 +96,7 @@ public class AuthController : ControllerBase
     /// <summary>
     /// 验证Token是否有效
     /// </summary>
-    /// <param name="token">JWT Token</param>
+    /// <param name="request">包含待验证的JWT Token</param>
     [HttpPost("validate")]
     [ProducesResponseType(typeof(ApiResponse<object>), StatusCodes.Status200OK)]
     public ActionResult<ApiResponse<object>> ValidateToken([FromBody] ValidateTokenRequestDto request)

@@ -31,8 +31,15 @@ public class XboxController : ControllerBase
         _logger = logger;
     }
 
+    // 获取当前用户ID
+    private int GetCurrentUserId()
+    {
+        var userIdClaim = User.FindFirst("user_id")?.Value ?? User.FindFirst("sub")?.Value;
+        return int.TryParse(userIdClaim, out var userId) ? userId : 1;
+    }
+
     /// <summary>
-    /// 初始化平台数据
+    /// 初始化平台数据（优化版本：批量检查，减少数据库查询）
     /// </summary>
     private async Task InitializePlatformsAsync()
     {
@@ -48,49 +55,66 @@ public class XboxController : ControllerBase
             new { Id = 8, Name = "Nintendo Switch", Description = "任天堂Switch平台" }
         };
 
+        // 批量检查所有平台ID和名称，只查询一次
+        var platformIds = platforms.Select(p => p.Id).ToList();
+        var platformNames = platforms.Select(p => p.Name).ToList();
+        
+        var existingPlatforms = await _context.Platforms
+            .Where(p => platformIds.Contains(p.PlatformId) || platformNames.Contains(p.PlatformName))
+            .Select(p => new { p.PlatformId, p.PlatformName })
+            .ToListAsync();
+
+        var existingIds = existingPlatforms.Select(p => p.PlatformId).ToHashSet();
+        var existingNames = existingPlatforms.Select(p => p.PlatformName).ToHashSet();
+
+        // 只插入不存在的平台
+        var platformsToInsert = platforms
+            .Where(p => !existingIds.Contains(p.Id) && !existingNames.Contains(p.Name))
+            .ToList();
+
+        if (platformsToInsert.Count == 0)
+        {
+            return; // 所有平台都已存在，无需操作
+        }
+
         var connection = _context.Database.GetDbConnection();
         if (connection.State != System.Data.ConnectionState.Open)
         {
             await connection.OpenAsync();
         }
 
-        foreach (var platformInfo in platforms)
+        // 批量插入（使用ON DUPLICATE KEY UPDATE避免重复）
+        foreach (var platformInfo in platformsToInsert)
         {
-            var exists = await _context.Platforms
-                .AnyAsync(p => p.PlatformId == platformInfo.Id || p.PlatformName == platformInfo.Name);
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                INSERT INTO platforms (platform_id, platform_name, description, status) 
+                VALUES (@id, @name, @desc, 1)
+                ON DUPLICATE KEY UPDATE platform_name = VALUES(platform_name), description = VALUES(description)";
+            
+            var idParam = command.CreateParameter();
+            idParam.ParameterName = "@id";
+            idParam.Value = platformInfo.Id;
+            command.Parameters.Add(idParam);
 
-            if (!exists)
+            var nameParam = command.CreateParameter();
+            nameParam.ParameterName = "@name";
+            nameParam.Value = platformInfo.Name;
+            command.Parameters.Add(nameParam);
+
+            var descParam = command.CreateParameter();
+            descParam.ParameterName = "@desc";
+            descParam.Value = platformInfo.Description ?? "";
+            command.Parameters.Add(descParam);
+
+            try
             {
-                using var command = connection.CreateCommand();
-                command.CommandText = @"
-                    INSERT INTO platforms (platform_id, platform_name, description, status) 
-                    VALUES (@id, @name, @desc, 1)
-                    ON DUPLICATE KEY UPDATE platform_name = VALUES(platform_name), description = VALUES(description)";
-                
-                var idParam = command.CreateParameter();
-                idParam.ParameterName = "@id";
-                idParam.Value = platformInfo.Id;
-                command.Parameters.Add(idParam);
-
-                var nameParam = command.CreateParameter();
-                nameParam.ParameterName = "@name";
-                nameParam.Value = platformInfo.Name;
-                command.Parameters.Add(nameParam);
-
-                var descParam = command.CreateParameter();
-                descParam.ParameterName = "@desc";
-                descParam.Value = platformInfo.Description ?? "";
-                command.Parameters.Add(descParam);
-
-                try
-                {
-                    await command.ExecuteNonQueryAsync();
-                    _logger.LogInformation("创建平台: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "创建平台失败: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
-                }
+                await command.ExecuteNonQueryAsync();
+                _logger.LogInformation("创建平台: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "创建平台失败: {PlatformName} (ID: {PlatformId})", platformInfo.Name, platformInfo.Id);
             }
         }
     }
@@ -108,9 +132,10 @@ public class XboxController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("检查Xbox令牌状态");
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("检查Xbox令牌状态: userId={UserId}", userId);
 
-            var result = await _xboxService.CheckTokenStatus();
+            var result = await _xboxService.CheckTokenStatus(userId, 7);
 
             return Ok(ApiResponse<XboxAuthResponseDto>.SuccessResponse(result, 
                 result.Success ? "令牌有效" : "令牌无效或不存在"));
@@ -164,9 +189,10 @@ public class XboxController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("开始Xbox认证, OpenBrowser={OpenBrowser}", request.OpenBrowser);
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("开始Xbox认证: userId={UserId}, OpenBrowser={OpenBrowser}", userId, request.OpenBrowser);
 
-            var result = await _xboxService.AuthenticateXbox(request);
+            var result = await _xboxService.AuthenticateXbox(request, userId);
 
             if (!result.Success)
             {
@@ -222,14 +248,14 @@ public class XboxController : ControllerBase
                 return BadRequest(ApiResponse<object>.ErrorResponse("BAD_REQUEST", $"用户ID {request.UserId} 不存在，请先创建用户"));
             }
 
-            var userId = request.UserId;
+            var userId = (int)request.UserId;
             _logger.LogInformation("导入Xbox数据: userId={UserId}, xboxUserId={XboxUserId}", userId, request.XboxUserId);
 
             // 初始化平台数据
             await InitializePlatformsAsync();
 
             // 获取Xbox用户信息
-            var xboxUser = await _xboxService.GetXboxUser(request.XboxUserId);
+            var xboxUser = await _xboxService.GetXboxUser(request.XboxUserId, userId);
             if (xboxUser == null)
             {
                 return BadRequest(ApiResponse<XboxImportResponseDto>.ErrorResponse("ERR_XBOX_USER_NOT_FOUND", "Xbox用户不存在或令牌无效，请先进行认证"));
@@ -268,7 +294,7 @@ public class XboxController : ControllerBase
             {
                 userPlatformBinding = new UserPlatformBinding
                 {
-                    UserId = userId,
+                    UserId = (int)userId,
                     PlatformId = XBOX_PLATFORM_ID,
                     PlatformUserId = xboxUser.Xuid,
                     BindingStatus = true,
@@ -280,9 +306,12 @@ public class XboxController : ControllerBase
             }
             else
             {
+                // 更新绑定时，更新绑定时间和同步时间
                 userPlatformBinding.PlatformUserId = xboxUser.Xuid;
                 userPlatformBinding.BindingStatus = true;
-                userPlatformBinding.LastSyncTime = DateTime.UtcNow;
+                userPlatformBinding.BindingTime = DateTime.UtcNow; // 更新绑定时间
+                userPlatformBinding.LastSyncTime = DateTime.UtcNow; // 更新同步时间
+                userPlatformBinding.ExpireTime = DateTime.UtcNow.AddYears(1); // 更新过期时间
             }
             await _context.SaveChangesAsync();
 
@@ -297,16 +326,17 @@ public class XboxController : ControllerBase
                     // 获取完整的Xbox游戏数据
                     _logger.LogInformation("开始导入Xbox游戏数据...");
                     
-                    var xboxGames = await _xboxService.GetXboxUserGames(request.XboxUserId);
+                    var xboxGames = await _xboxService.GetXboxUserGames(request.XboxUserId, userId);
                     
                     foreach (var xboxGame in xboxGames)
                     {
                         try
                         {
-                            // 查找或创建游戏
-                            var game = await _context.Games
+                            // 先通过游戏名称查找是否已存在同名游戏（不同平台的同名游戏共享同一个game_id）
+                            Game? game = await _context.Games
                                 .FirstOrDefaultAsync(g => g.Name == xboxGame.Name);
 
+                            // 如果游戏不存在，创建新游戏
                             if (game == null)
                             {
                                 // 创建新游戏
@@ -369,8 +399,11 @@ public class XboxController : ControllerBase
                                 }
                             }
 
-                            // 创建或更新游戏平台映射
-                            if (!await _context.GamePlatforms.AnyAsync(gp => gp.GameId == game.GameId && gp.PlatformId == XBOX_PLATFORM_ID))
+                            // 创建或更新游戏平台映射（如果该平台映射不存在）
+                            var gamePlatform = await _context.GamePlatforms
+                                .FirstOrDefaultAsync(gp => gp.GameId == game.GameId && gp.PlatformId == XBOX_PLATFORM_ID);
+                            
+                            if (gamePlatform == null)
                             {
                                 _context.GamePlatforms.Add(new GamePlatform
                                 {
@@ -379,6 +412,14 @@ public class XboxController : ControllerBase
                                     PlatformGameId = xboxGame.TitleId,
                                     GamePlatformUrl = $"https://www.xbox.com/games/store/-/{xboxGame.TitleId}"
                                 });
+                                await _context.SaveChangesAsync();
+                            }
+                            else if (gamePlatform.PlatformGameId != xboxGame.TitleId)
+                            {
+                                // 更新平台游戏ID（如果不同）
+                                gamePlatform.PlatformGameId = xboxGame.TitleId;
+                                gamePlatform.GamePlatformUrl = $"https://www.xbox.com/games/store/-/{xboxGame.TitleId}";
+                                await _context.SaveChangesAsync();
                             }
 
                             // 创建或更新用户平台游戏库记录
@@ -438,6 +479,186 @@ public class XboxController : ControllerBase
                 }
             }
 
+            // 导入成就数据
+            if (request.ImportAchievements)
+            {
+                try
+                {
+                    _logger.LogInformation("开始导入Xbox游戏成就数据...");
+                    
+                    // 获取用户游戏列表（只获取已导入的游戏）
+                    var userGames = await _context.UserPlatformLibraries
+                        .Where(upl => upl.PlatformUserId == request.XboxUserId && upl.PlatformId == XBOX_PLATFORM_ID)
+                        .Include(upl => upl.Game)
+                        .ToListAsync();
+                    
+                    if (userGames.Count == 0)
+                    {
+                        _logger.LogWarning("用户没有已导入的游戏，无法导入成就数据");
+                    }
+                    else
+                    {
+                        int achievementsImported = 0;
+                        int userAchievementsUpdated = 0;
+                        
+                        foreach (var userGame in userGames)
+                        {
+                            try
+                            {
+                                // 获取游戏的 Xbox TitleId
+                                var gamePlatform = await _context.GamePlatforms
+                                    .FirstOrDefaultAsync(gp => gp.GameId == userGame.GameId && gp.PlatformId == XBOX_PLATFORM_ID);
+                                
+                                if (gamePlatform == null || string.IsNullOrEmpty(gamePlatform.PlatformGameId))
+                                {
+                                    _logger.LogWarning("游戏 {GameId} 没有Xbox平台映射，跳过成就导入", userGame.GameId);
+                                    continue;
+                                }
+                                
+                                var titleId = gamePlatform.PlatformGameId;
+                                _logger.LogInformation("开始导入游戏成就: gameId={GameId}, titleId={TitleId}, gameName={GameName}", 
+                                    userGame.GameId, titleId, userGame.Game.Name);
+                                
+                                // 调用服务获取游戏成就
+                                var achievementsData = await _xboxService.GetXboxGameAchievements(request.XboxUserId, userId, titleId);
+                                
+                                if (achievementsData == null || achievementsData.Count == 0)
+                                {
+                                    _logger.LogWarning("游戏 {GameId} (titleId={TitleId}) 没有获取到成就数据", userGame.GameId, titleId);
+                                    continue;
+                                }
+                                
+                                // 处理每个成就
+                                foreach (var achData in achievementsData)
+                                {
+                                    try
+                                    {
+                                        // 查找或创建成就记录（成就是游戏级别的，不区分平台）
+                                        var achievement = await _context.Achievements
+                                            .FirstOrDefaultAsync(a => a.GameId == userGame.GameId && a.AchievementName == achData.Id);
+                                        
+                                        if (achievement == null)
+                                        {
+                                            // 创建新成就记录
+                                            achievement = new Achievement
+                                            {
+                                                GameId = userGame.GameId,
+                                                PlatformId = XBOX_PLATFORM_ID,
+                                                AchievementName = achData.Id,
+                                                DisplayName = achData.Name,
+                                                Description = achData.Description,
+                                                Hidden = achData.IsSecret,
+                                                IconUnlocked = achData.IconUnlocked ?? "",
+                                                IconLocked = achData.IconLocked ?? ""
+                                            };
+                                            _context.Achievements.Add(achievement);
+                                            await _context.SaveChangesAsync(); // 保存以获取 AchievementId
+                                            achievementsImported++;
+                                            _logger.LogInformation("创建新成就: gameId={GameId}, achievementId={AchievementId}, name={Name}", 
+                                                userGame.GameId, achievement.AchievementId, achData.Name);
+                                        }
+                                        else
+                                        {
+                                            // 更新已有成就的缺失字段
+                                            bool needsUpdate = false;
+                                            
+                                            if (string.IsNullOrEmpty(achievement.DisplayName) && !string.IsNullOrEmpty(achData.Name))
+                                            {
+                                                achievement.DisplayName = achData.Name;
+                                                needsUpdate = true;
+                                            }
+                                            
+                                            if (string.IsNullOrEmpty(achievement.Description) && !string.IsNullOrEmpty(achData.Description))
+                                            {
+                                                achievement.Description = achData.Description;
+                                                needsUpdate = true;
+                                            }
+                                            
+                                            if (string.IsNullOrEmpty(achievement.IconUnlocked) && !string.IsNullOrEmpty(achData.IconUnlocked))
+                                            {
+                                                achievement.IconUnlocked = achData.IconUnlocked;
+                                                needsUpdate = true;
+                                            }
+                                            
+                                            if (string.IsNullOrEmpty(achievement.IconLocked) && !string.IsNullOrEmpty(achData.IconLocked))
+                                            {
+                                                achievement.IconLocked = achData.IconLocked;
+                                                needsUpdate = true;
+                                            }
+                                            
+                                            if (needsUpdate)
+                                            {
+                                                await _context.SaveChangesAsync();
+                                            }
+                                        }
+                                        
+                                        // 创建或更新用户成就解锁记录
+                                        var userAchievement = await _context.UserAchievements
+                                            .FirstOrDefaultAsync(ua => ua.UserId == userId 
+                                                && ua.AchievementId == achievement.AchievementId 
+                                                && ua.PlatformId == XBOX_PLATFORM_ID);
+                                        
+                                        var unlockTime = achData.IsUnlocked && !string.IsNullOrEmpty(achData.UnlockTime)
+                                            ? DateTime.TryParse(achData.UnlockTime, out var dt) ? dt : (DateTime?)null
+                                            : null;
+                                        
+                                        if (userAchievement == null)
+                                        {
+                                            // 创建新用户成就记录
+                                            userAchievement = new UserAchievement
+                                            {
+                                                UserId = userId,
+                                                AchievementId = achievement.AchievementId,
+                                                PlatformId = XBOX_PLATFORM_ID,
+                                                Unlocked = achData.IsUnlocked,
+                                                UnlockTime = unlockTime
+                                            };
+                                            _context.UserAchievements.Add(userAchievement);
+                                            userAchievementsUpdated++;
+                                        }
+                                        else
+                                        {
+                                            // 更新现有记录
+                                            bool wasUnlocked = userAchievement.Unlocked;
+                                            userAchievement.Unlocked = achData.IsUnlocked;
+                                            userAchievement.UnlockTime = unlockTime;
+                                            
+                                            // 如果状态发生变化，记录更新
+                                            if (wasUnlocked != achData.IsUnlocked)
+                                            {
+                                                userAchievementsUpdated++;
+                                            }
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        _logger.LogError(ex, "处理成就失败: gameId={GameId}, achievementId={AchievementId}", 
+                                            userGame.GameId, achData.Id);
+                                    }
+                                }
+                                
+                                // 批量保存用户成就记录
+                                await _context.SaveChangesAsync();
+                                _logger.LogInformation("游戏 {GameId} 成就导入完成: 成就数={AchievementsCount}, 用户成就更新数={UserAchievementsCount}", 
+                                    userGame.GameId, achievementsData.Count, userAchievementsUpdated);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "导入游戏成就失败: gameId={GameId}", userGame.GameId);
+                            }
+                        }
+                        
+                        achievementsCount = achievementsImported;
+                        _logger.LogInformation("成功导入 {Count} 个成就和 {UserAchievementsCount} 条用户成就记录", 
+                            achievementsImported, userAchievementsUpdated);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "导入成就数据失败");
+                }
+            }
+
             var result = new XboxImportResponseDto
             {
                 TaskId = $"import_{DateTime.UtcNow:yyyyMMdd_HHmmss}",
@@ -471,9 +692,10 @@ public class XboxController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("获取Xbox用户信息: xuid={Xuid}", xuid);
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("获取Xbox用户信息: xuid={Xuid}, userId={UserId}", xuid, userId);
 
-            var result = await _xboxService.GetXboxUser(xuid);
+            var result = await _xboxService.GetXboxUser(xuid, userId);
 
             if (result == null)
             {
@@ -500,9 +722,10 @@ public class XboxController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("获取Xbox游戏信息: titleId={TitleId}", titleId);
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("获取Xbox游戏信息: titleId={TitleId}, userId={UserId}", titleId, userId);
 
-            var result = await _xboxService.GetXboxGame(titleId);
+            var result = await _xboxService.GetXboxGame(titleId, userId);
 
             if (result == null)
             {
@@ -528,9 +751,10 @@ public class XboxController : ControllerBase
     {
         try
         {
-            _logger.LogInformation("获取Xbox用户成就: xuid={Xuid}", xuid);
+            var userId = GetCurrentUserId();
+            _logger.LogInformation("获取Xbox用户成就: xuid={Xuid}, userId={UserId}", xuid, userId);
 
-            var result = await _xboxService.GetXboxUserAchievements(xuid);
+            var result = await _xboxService.GetXboxUserAchievements(xuid, userId);
 
             return Ok(ApiResponse<List<XboxUserAchievementDto>>.SuccessResponse(result));
         }

@@ -1,4 +1,7 @@
 using PlayLinker.Models.DTOs;
+using PlayLinker.Models.Entities;
+using PlayLinker.Data;
+using Microsoft.EntityFrameworkCore;
 using System.Diagnostics;
 using System.Text.Json;
 
@@ -12,14 +15,23 @@ public class XboxService : IXboxService
 {
     private readonly IConfiguration _configuration;
     private readonly ILogger<XboxService> _logger;
+    private readonly ITokenEncryptionService _encryptionService;
+    private readonly PlayLinkerDbContext _context;
     private readonly string _pythonPath;
     private readonly string _scriptsPath;
     private readonly string _tokensPath;
 
-    public XboxService(IConfiguration configuration, ILogger<XboxService> logger, IWebHostEnvironment environment)
+    public XboxService(
+        IConfiguration configuration, 
+        ILogger<XboxService> logger, 
+        IWebHostEnvironment environment,
+        ITokenEncryptionService encryptionService,
+        PlayLinkerDbContext context)
     {
         _configuration = configuration;
         _logger = logger;
+        _encryptionService = encryptionService;
+        _context = context;
 
         // 获取Python路径（从配置或环境变量）
         _pythonPath = configuration["XboxAPI:PythonPath"] ?? "python";
@@ -30,12 +42,247 @@ public class XboxService : IXboxService
         // 令牌路径：Backend/Tokens
         _tokensPath = Path.Combine(environment.ContentRootPath, "Tokens");
 
-        // 确保目录存在
+        // 确保目录存在（用于临时文件）
         Directory.CreateDirectory(_scriptsPath);
         Directory.CreateDirectory(_tokensPath);
 
         _logger.LogInformation("XboxService 初始化: PythonPath={PythonPath}, ScriptsPath={ScriptsPath}, TokensPath={TokensPath}",
             _pythonPath, _scriptsPath, _tokensPath);
+    }
+
+    /// <summary>
+    /// 从数据库加载令牌到临时文件
+    /// </summary>
+    private async Task<string?> LoadTokenFromDatabase(int userId, int platformId)
+    {
+        try
+        {
+            // 先尝试查找 BindingStatus 为 true 的绑定
+            var binding = await _context.UserPlatformBindings
+                .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == platformId && b.BindingStatus == true);
+            
+            // 如果没找到，尝试查找任何有令牌的绑定（可能是 BindingStatus 为 null 或 false）
+            if (binding == null)
+            {
+                binding = await _context.UserPlatformBindings
+                    .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == platformId && !string.IsNullOrEmpty(b.AccessToken));
+                
+                if (binding != null)
+                {
+                    _logger.LogWarning("找到绑定记录但BindingStatus不为true，将更新为true: UserId={UserId}, PlatformId={PlatformId}, BindingStatus={BindingStatus}", 
+                        userId, platformId, binding.BindingStatus);
+                    // 自动修复 BindingStatus
+                    binding.BindingStatus = true;
+                    await _context.SaveChangesAsync();
+                }
+            }
+            
+            if (binding == null)
+            {
+                // 检查是否存在绑定记录（即使没有令牌）
+                var anyBinding = await _context.UserPlatformBindings
+                    .AnyAsync(b => b.UserId == userId && b.PlatformId == platformId);
+                
+                if (anyBinding)
+                {
+                    _logger.LogWarning("用户{UserId}存在平台{PlatformId}的绑定记录，但令牌为空", userId, platformId);
+                }
+                else
+                {
+                    _logger.LogWarning("用户{UserId}未绑定平台{PlatformId}", userId, platformId);
+                }
+                return null;
+            }
+            
+            if (string.IsNullOrEmpty(binding.AccessToken))
+            {
+                _logger.LogWarning("用户{UserId}的平台{PlatformId}绑定记录存在，但AccessToken为空", userId, platformId);
+                return null;
+            }
+            
+            // 解密令牌
+            var decryptedToken = _encryptionService.DecryptToken(binding.AccessToken);
+            
+            if (string.IsNullOrEmpty(decryptedToken))
+            {
+                _logger.LogError("解密后的令牌为空: UserId={UserId}, PlatformId={PlatformId}", userId, platformId);
+                return null;
+            }
+            
+            // 写入临时文件（按用户ID区分）
+            var tempFilePath = Path.Combine(_tokensPath, $"xbox_tokens_{userId}_{Guid.NewGuid():N}.json");
+            await File.WriteAllTextAsync(tempFilePath, decryptedToken);
+            
+            _logger.LogInformation("令牌已从数据库加载到临时文件: UserId={UserId}, PlatformId={PlatformId}, TempFile={TempFile}", 
+                userId, platformId, tempFilePath);
+            return tempFilePath;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "从数据库加载令牌失败: UserId={UserId}, PlatformId={PlatformId}", userId, platformId);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 保存令牌到数据库（如果绑定不存在则创建）
+    /// </summary>
+    private async Task<bool> SaveTokenToDatabase(int userId, int platformId, string tokenJson, string? xuid = null)
+    {
+        try
+        {
+            var binding = await _context.UserPlatformBindings
+                .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == platformId);
+            
+            if (binding != null)
+            {
+                // 更新现有绑定
+                var encryptedToken = _encryptionService.EncryptToken(tokenJson);
+                binding.AccessToken = encryptedToken;
+                binding.BindingStatus = true; // 确保绑定状态为true
+                binding.LastSyncTime = DateTime.UtcNow;
+                binding.ExpireTime = DateTime.UtcNow.AddYears(1); // Xbox令牌有效期1年
+                
+                // 如果提供了XUID，更新PlatformUserId
+                if (!string.IsNullOrEmpty(xuid))
+                {
+                    binding.PlatformUserId = xuid;
+                }
+                
+                await _context.SaveChangesAsync();
+                
+                _logger.LogInformation("令牌已更新到数据库: UserId={UserId}, PlatformId={PlatformId}, BindingStatus={BindingStatus}", 
+                    userId, platformId, binding.BindingStatus);
+                return true;
+            }
+            
+            // 绑定不存在，需要创建
+            // 如果xuid为空，使用临时标识符，后续可以通过同步更新
+            var platformUserId = xuid ?? $"temp_{userId}_{platformId}_{DateTime.UtcNow:yyyyMMddHHmmss}";
+            
+            // 先确保PlayerPlatform记录存在（外键约束要求）
+            var playerPlatform = await _context.PlayerPlatforms
+                .FirstOrDefaultAsync(pp => pp.PlatformUserId == platformUserId && pp.PlatformId == platformId);
+            
+            if (playerPlatform == null)
+            {
+                // 注意：此时令牌还未保存，无法调用GetXboxUser（需要令牌）
+                // 先使用基本信息创建PlayerPlatform记录，后续可以通过同步更新
+                _logger.LogInformation("创建PlayerPlatform记录: PlatformUserId={PlatformUserId}", platformUserId);
+                playerPlatform = new PlayerPlatform
+                {
+                    PlatformUserId = platformUserId,
+                    PlatformId = platformId,
+                    ProfileName = xuid ?? $"临时用户_{userId}"  // 暂时使用临时名称，后续可以更新
+                };
+                _context.PlayerPlatforms.Add(playerPlatform);
+                
+                try
+                {
+                    await _context.SaveChangesAsync();
+                    _logger.LogInformation("已创建PlayerPlatform记录: PlatformUserId={PlatformUserId}", platformUserId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "创建PlayerPlatform记录失败: PlatformUserId={PlatformUserId}", platformUserId);
+                    throw; // 重新抛出异常，因为这是必需的
+                }
+            }
+            
+            // 确保playerPlatform已保存（重新查询以确保数据一致性）
+            playerPlatform = await _context.PlayerPlatforms
+                .FirstOrDefaultAsync(pp => pp.PlatformUserId == platformUserId && pp.PlatformId == platformId);
+            
+            if (playerPlatform == null)
+            {
+                _logger.LogError("PlayerPlatform记录不存在，无法创建绑定: PlatformUserId={PlatformUserId}, PlatformId={PlatformId}", platformUserId, platformId);
+                return false;
+            }
+            
+            // 创建新的绑定记录
+            var encryptedTokenForNewBinding = _encryptionService.EncryptToken(tokenJson);
+            binding = new UserPlatformBinding
+            {
+                UserId = userId,
+                PlatformId = platformId,
+                PlatformUserId = platformUserId,  // 必须与playerPlatform.PlatformUserId完全一致
+                AccessToken = encryptedTokenForNewBinding,
+                BindingStatus = true,
+                BindingTime = DateTime.UtcNow,
+                LastSyncTime = DateTime.UtcNow,
+                ExpireTime = DateTime.UtcNow.AddYears(1) // Xbox令牌有效期1年
+            };
+            
+            _context.UserPlatformBindings.Add(binding);
+            
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "保存UserPlatformBinding失败: PlatformUserId={PlatformUserId}, PlatformId={PlatformId}, PlayerPlatform存在={PlayerPlatformExists}", 
+                    platformUserId, platformId, playerPlatform != null);
+                throw;
+            }
+            
+            _logger.LogInformation("已创建绑定记录并保存令牌: UserId={UserId}, PlatformId={PlatformId}, PlatformUserId={PlatformUserId}, Xuid={Xuid}", 
+                userId, platformId, platformUserId, xuid ?? "未提供");
+            
+            // 如果xuid为空，尝试从令牌中获取xuid并更新
+            if (string.IsNullOrEmpty(xuid))
+            {
+                try
+                {
+                    // 尝试从令牌JSON中解析xuid
+                    var tokenData = JsonSerializer.Deserialize<JsonElement>(tokenJson);
+                    if (tokenData.TryGetProperty("xsts_token", out var xstsToken) && 
+                        xstsToken.TryGetProperty("xuid", out var xuidElement))
+                    {
+                        var extractedXuid = xuidElement.GetString();
+                        if (!string.IsNullOrEmpty(extractedXuid) && extractedXuid != platformUserId)
+                        {
+                            _logger.LogInformation("从令牌中提取到XUID，更新绑定: {Xuid}", extractedXuid);
+                            // 更新绑定和PlayerPlatform的PlatformUserId
+                            binding.PlatformUserId = extractedXuid;
+                            playerPlatform.PlatformUserId = extractedXuid;
+                            await _context.SaveChangesAsync();
+                            _logger.LogInformation("已更新PlatformUserId为XUID: {Xuid}", extractedXuid);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "尝试从令牌中提取XUID失败，将使用临时标识符");
+                }
+            }
+            
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "保存令牌到数据库失败");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 清理临时令牌文件
+    /// </summary>
+    private void CleanupTempTokenFile(string? tempFilePath)
+    {
+        try
+        {
+            if (!string.IsNullOrEmpty(tempFilePath) && File.Exists(tempFilePath))
+            {
+                File.Delete(tempFilePath);
+                _logger.LogInformation("临时令牌文件已删除: {TempFile}", tempFilePath);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "删除临时令牌文件失败: {TempFile}", tempFilePath);
+        }
     }
 
     /// <summary>
@@ -257,29 +504,28 @@ public class XboxService : IXboxService
     }
 
     /// <summary>
-    /// 检查令牌状态
+    /// 检查令牌状态（从数据库）
     /// </summary>
-    public async Task<XboxAuthResponseDto> CheckTokenStatus(string? tokensPath = null)
+    public async Task<XboxAuthResponseDto> CheckTokenStatus(int userId, int platformId = 7)
     {
         try
         {
-            var tokenPath = GetTokenFilePath(tokensPath);
-            var tokenExists = File.Exists(tokenPath);
+            var binding = await _context.UserPlatformBindings
+                .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == platformId && b.BindingStatus == true);
 
-            if (!tokenExists)
+            if (binding == null || string.IsNullOrEmpty(binding.AccessToken))
             {
                 return new XboxAuthResponseDto
                 {
                     Success = false,
-                    Message = "令牌文件不存在，需要首次认证",
+                    Message = "用户未绑定Xbox平台或令牌不存在，需要首次认证",
                     TokenExists = false,
-                    TokensPath = tokenPath,
                     NeedsBrowserAuth = true
                 };
             }
 
             // 尝试使用令牌获取数据（验证令牌有效性）
-            var xboxData = await GetXboxDataFromPython(tokensPath);
+            var xboxData = await GetXboxDataFromPython(userId, platformId);
             
             if (xboxData != null && xboxData.RootElement.TryGetProperty("success", out var success) && success.GetBoolean())
             {
@@ -289,7 +535,6 @@ public class XboxService : IXboxService
                     Success = true,
                     Message = "令牌有效",
                     TokenExists = true,
-                    TokensPath = tokenPath,
                     Xuid = xuid,
                     NeedsBrowserAuth = false
                 };
@@ -301,7 +546,6 @@ public class XboxService : IXboxService
                     Success = false,
                     Message = "令牌已过期或无效，需要重新认证",
                     TokenExists = true,
-                    TokensPath = tokenPath,
                     NeedsBrowserAuth = true
                 };
             }
@@ -320,52 +564,62 @@ public class XboxService : IXboxService
     }
 
     /// <summary>
-    /// 执行Xbox认证
+    /// 执行Xbox认证（首次认证，生成并保存令牌到数据库）
     /// </summary>
-    public async Task<XboxAuthResponseDto> AuthenticateXbox(XboxAuthRequestDto request)
+    public async Task<XboxAuthResponseDto> AuthenticateXbox(XboxAuthRequestDto request, int userId)
     {
+        string? tempTokenPath = null;
         try
         {
-            _logger.LogInformation("开始Xbox认证, OpenBrowser={OpenBrowser}", request.OpenBrowser);
+            _logger.LogInformation("开始Xbox认证: userId={UserId}, OpenBrowser={OpenBrowser}", userId, request.OpenBrowser);
 
-            var tokenPath = GetTokenFilePath(request.TokensPath);
+            // 使用临时文件进行认证
+            tempTokenPath = Path.Combine(_tokensPath, $"xbox_tokens_auth_{userId}_{Guid.NewGuid():N}.json");
             
-            // 如果强制重新认证，删除旧令牌
-            if (request.ForceReauth && File.Exists(tokenPath))
+            // 如果强制重新认证，删除数据库中的旧令牌
+            if (request.ForceReauth)
             {
-                File.Delete(tokenPath);
-                _logger.LogInformation("已删除旧令牌文件");
+                var binding = await _context.UserPlatformBindings
+                    .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == 7);
+                if (binding != null)
+                {
+                    binding.AccessToken = null;
+                    binding.BindingStatus = false;
+                    await _context.SaveChangesAsync();
+                    _logger.LogInformation("已删除数据库中的旧令牌");
+                }
             }
 
             // 如果不需要打开浏览器，先检查令牌是否存在且有效
             if (!request.OpenBrowser)
             {
-                if (!File.Exists(tokenPath))
+                var binding = await _context.UserPlatformBindings
+                    .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == 7 && b.BindingStatus == true);
+                
+                if (binding == null || string.IsNullOrEmpty(binding.AccessToken))
                 {
                     return new XboxAuthResponseDto
                     {
                         Success = false,
-                        Message = "令牌文件不存在，请先在本地环境完成首次认证，或设置 openBrowser=true",
+                        Message = "令牌不存在，请先进行首次认证（设置 openBrowser=true）",
                         TokenExists = false,
-                        TokensPath = tokenPath,
                         NeedsBrowserAuth = true
                     };
                 }
 
                 // 尝试刷新令牌
                 _logger.LogInformation("尝试刷新现有令牌");
-                var xboxData = await GetXboxDataFromPython(tokenPath);
+                var xboxData = await GetXboxDataFromPython(userId, 7);
                 
                 if (xboxData != null && xboxData.RootElement.TryGetProperty("success", out var success) && success.GetBoolean())
                 {
-                    var xuid = xboxData.RootElement.TryGetProperty("xuid", out var xuidProp) ? xuidProp.GetString() : null;
+                    var refreshedXuid = xboxData.RootElement.TryGetProperty("xuid", out var xuidProp) ? xuidProp.GetString() : null;
                     return new XboxAuthResponseDto
                     {
                         Success = true,
                         Message = "令牌刷新成功",
                         TokenExists = true,
-                        TokensPath = tokenPath,
-                        Xuid = xuid,
+                        Xuid = refreshedXuid,
                         NeedsBrowserAuth = false
                     };
                 }
@@ -374,9 +628,8 @@ public class XboxService : IXboxService
                     return new XboxAuthResponseDto
                     {
                         Success = false,
-                        Message = "令牌刷新失败，令牌可能已过期。请设置 openBrowser=true 重新认证，或在本地完成认证后上传tokens文件",
+                        Message = "令牌刷新失败，令牌可能已过期。请设置 openBrowser=true 重新认证",
                         TokenExists = true,
-                        TokensPath = tokenPath,
                         NeedsBrowserAuth = true
                     };
                 }
@@ -392,8 +645,7 @@ public class XboxService : IXboxService
                 {
                     Success = false,
                     Message = $"Python环境问题: {envMessage}",
-                    TokenExists = File.Exists(tokenPath),
-                    TokensPath = tokenPath,
+                    TokenExists = false,
                     NeedsBrowserAuth = true
                 };
             }
@@ -406,7 +658,7 @@ public class XboxService : IXboxService
             _logger.LogInformation("如果浏览器未自动打开，请查看下方日志中的认证URL");
             _logger.LogInformation("=" + new string('=', 80));
             
-            var arguments = $"--tokens \"{tokenPath}\" --port 8080";
+            var arguments = $"--tokens \"{tempTokenPath}\" --port 8080";
             
             int exitCode;
             string output;
@@ -432,6 +684,49 @@ public class XboxService : IXboxService
                 {
                     var errorMessage = !string.IsNullOrEmpty(error) ? error : "Python脚本执行失败，未返回错误信息";
                     
+                    // 尝试从输出中解析错误信息
+                    if (!string.IsNullOrEmpty(output))
+                    {
+                        try
+                        {
+                            var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                            var jsonLine = lines.LastOrDefault(l => l.Trim().StartsWith("{"));
+                            
+                            if (!string.IsNullOrEmpty(jsonLine))
+                            {
+                                var result = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(jsonLine);
+                                if (result != null && result.ContainsKey("message"))
+                                {
+                                    var msg = result["message"].GetString();
+                                    if (!string.IsNullOrEmpty(msg))
+                                    {
+                                        errorMessage = msg;
+                                    }
+                                    
+                                    // 如果有更详细的错误信息，也包含进来
+                                    if (result.ContainsKey("error_type"))
+                                    {
+                                        var errorType = result["error_type"].GetString();
+                                        errorMessage = $"{errorType}: {errorMessage}";
+                                    }
+                                    
+                                    if (result.ContainsKey("traceback"))
+                                    {
+                                        var traceback = result["traceback"].GetString();
+                                        if (!string.IsNullOrEmpty(traceback))
+                                        {
+                                            _logger.LogError("Python脚本详细错误堆栈: {Traceback}", traceback);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "解析Python错误输出失败，使用原始错误信息");
+                        }
+                    }
+                    
                     // 检查是否是依赖问题
                     if (error.Contains("ModuleNotFoundError") || error.Contains("ImportError"))
                     {
@@ -447,8 +742,7 @@ public class XboxService : IXboxService
                     {
                         Success = false,
                         Message = errorMessage,
-                        TokenExists = File.Exists(tokenPath),
-                        TokensPath = tokenPath,
+                        TokenExists = false,
                         NeedsBrowserAuth = true
                     };
                 }
@@ -460,13 +754,13 @@ public class XboxService : IXboxService
                 {
                     Success = false,
                     Message = $"执行认证脚本失败: {ex.Message}",
-                    TokenExists = File.Exists(tokenPath),
-                    TokensPath = tokenPath,
+                    TokenExists = false,
                     NeedsBrowserAuth = true
                 };
             }
 
             // 解析输出
+            string? xuid = null;
             try
             {
                 // 输出可能包含多行，取最后一行JSON
@@ -482,12 +776,85 @@ public class XboxService : IXboxService
                 
                 if (result != null && result.ContainsKey("success") && result["success"].GetBoolean())
                 {
+                    xuid = result.ContainsKey("xuid") ? result["xuid"].GetString() : null;
+                    
+                    // 认证成功，读取令牌文件并保存到数据库
+                    if (File.Exists(tempTokenPath))
+                    {
+                        try
+                        {
+                            var tokenJson = await File.ReadAllTextAsync(tempTokenPath);
+                            
+                            // 如果xuid为空，尝试从令牌JSON中解析
+                            if (string.IsNullOrEmpty(xuid))
+                            {
+                                try
+                                {
+                                    var tokenData = JsonSerializer.Deserialize<JsonElement>(tokenJson);
+                                    if (tokenData.TryGetProperty("xsts_token", out var xstsToken) && 
+                                        xstsToken.TryGetProperty("xuid", out var xuidElement))
+                                    {
+                                        xuid = xuidElement.GetString();
+                                        _logger.LogInformation("从令牌中提取到XUID: {Xuid}", xuid);
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.LogWarning(ex, "从令牌中提取XUID失败，将使用临时标识符");
+                                }
+                            }
+                            
+                            // 保存令牌到数据库（即使xuid为空也会保存，使用临时标识符）
+                            var saveSuccess = await SaveTokenToDatabase(userId, 7, tokenJson, xuid);
+                            if (saveSuccess)
+                            {
+                                _logger.LogInformation("令牌已保存到数据库: UserId={UserId}, Xuid={Xuid}", userId, xuid ?? "临时标识符");
+                                
+                                // 如果xuid仍然为空，尝试通过API获取
+                                if (string.IsNullOrEmpty(xuid))
+                                {
+                                    try
+                                    {
+                                        // 使用刚保存的令牌获取用户信息
+                                        var xboxUser = await GetXboxUser("me", userId);
+                                        if (xboxUser != null && !string.IsNullOrEmpty(xboxUser.Xuid))
+                                        {
+                                            xuid = xboxUser.Xuid;
+                                            _logger.LogInformation("通过API获取到XUID: {Xuid}", xuid);
+                                            
+                                            // 更新绑定记录中的PlatformUserId
+                                            var binding = await _context.UserPlatformBindings
+                                                .FirstOrDefaultAsync(b => b.UserId == userId && b.PlatformId == 7);
+                                            if (binding != null && binding.PlatformUserId != xuid)
+                                            {
+                                                binding.PlatformUserId = xuid;
+                                                await _context.SaveChangesAsync();
+                                                _logger.LogInformation("已更新绑定记录中的PlatformUserId: {Xuid}", xuid);
+                                            }
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        _logger.LogWarning(ex, "通过API获取XUID失败，将使用临时标识符");
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                _logger.LogWarning("令牌保存失败，但认证已成功");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "保存令牌到数据库失败");
+                        }
+                    }
+                    
                     return new XboxAuthResponseDto
                     {
                         Success = true,
                         Message = result.ContainsKey("message") ? result["message"].GetString() ?? "认证成功" : "认证成功",
-                        Xuid = result.ContainsKey("xuid") ? result["xuid"].GetString() : null,
-                        TokensPath = tokenPath,
+                        Xuid = xuid,
                         TokenExists = true,
                         NeedsBrowserAuth = false
                     };
@@ -501,7 +868,6 @@ public class XboxService : IXboxService
                         Success = false,
                         Message = "需要在浏览器中完成认证",
                         AuthUrl = authUrl,
-                        TokensPath = tokenPath,
                         TokenExists = false,
                         NeedsBrowserAuth = true
                     };
@@ -512,8 +878,7 @@ public class XboxService : IXboxService
                     {
                         Success = false,
                         Message = result?.ContainsKey("message") == true ? result["message"].GetString() ?? "认证失败" : "认证失败",
-                        TokenExists = File.Exists(tokenPath),
-                        TokensPath = tokenPath,
+                        TokenExists = false,
                         NeedsBrowserAuth = true
                     };
                 }
@@ -525,8 +890,7 @@ public class XboxService : IXboxService
                 {
                     Success = false,
                     Message = $"解析认证结果失败: {ex.Message}",
-                    TokenExists = File.Exists(tokenPath),
-                    TokensPath = tokenPath,
+                    TokenExists = false,
                     NeedsBrowserAuth = true
                 };
             }
@@ -542,24 +906,186 @@ public class XboxService : IXboxService
                 NeedsBrowserAuth = true
             };
         }
+        finally
+        {
+            // 清理临时文件
+            CleanupTempTokenFile(tempTokenPath);
+        }
     }
 
     /// <summary>
-    /// 获取Xbox数据
+    /// 获取Xbox游戏成就数据
     /// </summary>
-    private async Task<JsonDocument?> GetXboxDataFromPython(string? tokensPath = null)
+    private async Task<JsonDocument?> GetXboxGameAchievementsFromPython(int userId, string xuid, string titleId)
     {
+        string? tempFilePath = null;
         try
         {
-            var tokenPath = GetTokenFilePath(tokensPath);
+            // 从数据库加载令牌到临时文件
+            tempFilePath = await LoadTokenFromDatabase(userId, 7);
             
-            if (!File.Exists(tokenPath))
+            if (tempFilePath == null)
             {
-                _logger.LogWarning("令牌文件不存在: {TokenPath}", tokenPath);
+                _logger.LogWarning("无法加载用户{UserId}的令牌", userId);
                 return null;
             }
 
-            var arguments = $"--tokens \"{tokenPath}\"";
+            var arguments = $"--tokens \"{tempFilePath}\" --xuid {xuid} --title-id {titleId}";
+            var (exitCode, output, error) = await RunPythonScript("xbox_get_achievements.py", arguments);
+
+            _logger.LogInformation("Python脚本执行完成: ExitCode={ExitCode}", exitCode);
+            
+            if (!string.IsNullOrEmpty(output))
+            {
+                _logger.LogInformation("Python输出长度: {Length} 字符", output.Length);
+            }
+            else
+            {
+                _logger.LogWarning("Python输出为空");
+            }
+            
+            if (!string.IsNullOrEmpty(error))
+            {
+                _logger.LogWarning("Python错误输出: {Error}", error);
+            }
+
+            // 解析JSON输出
+            try
+            {
+                if (string.IsNullOrWhiteSpace(output))
+                {
+                    _logger.LogError("Python脚本没有输出任何内容，ExitCode={ExitCode}, Error={Error}", exitCode, error);
+                    return null;
+                }
+                
+                // 方法1：直接查找第一个 { 和最后一个 }，提取完整的 JSON
+                var firstBraceIdx = output.IndexOf('{');
+                var lastBraceIdx = output.LastIndexOf('}');
+                
+                if (firstBraceIdx >= 0 && lastBraceIdx > firstBraceIdx)
+                {
+                    var jsonContent = output.Substring(firstBraceIdx, lastBraceIdx - firstBraceIdx + 1);
+                    _logger.LogInformation("从输出中提取 JSON: 起始位置={Start}, 结束位置={End}, 长度={Length}", 
+                        firstBraceIdx, lastBraceIdx, jsonContent.Length);
+                    
+                    try
+                    {
+                        return JsonDocument.Parse(jsonContent);
+                    }
+                    catch (JsonException jsonEx)
+                    {
+                        _logger.LogWarning(jsonEx, "直接提取的 JSON 解析失败，尝试清理后重新解析");
+                        
+                        // 方法2：清理可能的日志行后重新提取
+                        var lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                        var jsonLines = new List<string>();
+                        bool inJson = false;
+                        
+                        foreach (var line in lines)
+                        {
+                            var trimmedLine = line.Trim();
+                            
+                            // 跳过日志行
+                            if (trimmedLine.StartsWith("INFO:") || 
+                                trimmedLine.StartsWith("WARNING:") || 
+                                trimmedLine.StartsWith("ERROR:") ||
+                                trimmedLine.StartsWith("DEBUG:"))
+                            {
+                                continue;
+                            }
+                            
+                            // 检测 JSON 开始
+                            if (!inJson && trimmedLine.StartsWith("{"))
+                            {
+                                inJson = true;
+                            }
+                            
+                            if (inJson)
+                            {
+                                jsonLines.Add(line);
+                                
+                                // 如果行以 } 结尾，可能是 JSON 结束
+                                if (trimmedLine.EndsWith("}"))
+                                {
+                                    // 检查是否所有括号都闭合
+                                    var testContent = string.Join("\n", jsonLines);
+                                    int testBraces = 0;
+                                    foreach (var ch in testContent)
+                                    {
+                                        if (ch == '{') testBraces++;
+                                        if (ch == '}') testBraces--;
+                                    }
+                                    if (testBraces == 0)
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        var cleanedJson = string.Join("\n", jsonLines);
+                        if (!string.IsNullOrWhiteSpace(cleanedJson))
+                        {
+                            _logger.LogInformation("使用清理后的 JSON: 长度={Length}", cleanedJson.Length);
+                            return JsonDocument.Parse(cleanedJson);
+                        }
+                        
+                        // 如果还是失败，记录错误并返回 null
+                        _logger.LogError("无法从Python输出中提取有效的JSON内容");
+                        _logger.LogDebug("原始输出前1000字符: {Output}", output.Length > 1000 ? output.Substring(0, 1000) : output);
+                        _logger.LogDebug("原始输出后1000字符: {Output}", output.Length > 1000 ? output.Substring(output.Length - 1000) : output);
+                        return null;
+                    }
+                }
+                else
+                {
+                    _logger.LogError("无法在Python输出中找到JSON内容（未找到 { 或 }）");
+                    _logger.LogDebug("原始输出前500字符: {Output}", output.Length > 500 ? output.Substring(0, 500) : output);
+                    return null;
+                }
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogError(ex, "解析Xbox成就数据JSON失败: ExitCode={ExitCode}", exitCode);
+                _logger.LogDebug("输出的后1000字符: {Output}", output.Length > 1000 ? output.Substring(output.Length - 1000) : output);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "解析Xbox成就数据时发生未预期的错误: ExitCode={ExitCode}", exitCode);
+                return null;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "获取Xbox游戏成就数据时发生错误");
+            return null;
+        }
+        finally
+        {
+            // 清理临时文件
+            CleanupTempTokenFile(tempFilePath);
+        }
+    }
+
+    /// <summary>
+    /// 获取Xbox数据（支持用户级令牌）
+    /// </summary>
+    private async Task<JsonDocument?> GetXboxDataFromPython(int userId, int platformId = 7)
+    {
+        string? tempFilePath = null;
+        try
+        {
+            // 从数据库加载令牌到临时文件
+            tempFilePath = await LoadTokenFromDatabase(userId, platformId);
+            
+            if (tempFilePath == null)
+            {
+                _logger.LogWarning("无法加载用户{UserId}的令牌", userId);
+                return null;
+            }
+
+            var arguments = $"--tokens \"{tempFilePath}\"";
             var (exitCode, output, error) = await RunPythonScript("xbox_get_data.py", arguments);
 
             _logger.LogInformation("Python脚本执行完成: ExitCode={ExitCode}", exitCode);
@@ -567,7 +1093,7 @@ public class XboxService : IXboxService
             if (!string.IsNullOrEmpty(output))
             {
                 _logger.LogInformation("Python输出长度: {Length} 字符", output.Length);
-                _logger.LogDebug("Python完整输出: {Output}", output);
+                _logger.LogInformation("Python完整输出: {Output}", output);
             }
             else
             {
@@ -623,7 +1149,7 @@ public class XboxService : IXboxService
                 if (jsonLines.Count == 0)
                 {
                     _logger.LogError("未找到有效的JSON输出，ExitCode={ExitCode}", exitCode);
-                    _logger.LogDebug("完整输出: {Output}", output);
+                    _logger.LogInformation("完整输出: {Output}", output);
                     if (!string.IsNullOrEmpty(error))
                     {
                         _logger.LogError("错误信息: {Error}", error);
@@ -634,9 +1160,19 @@ public class XboxService : IXboxService
                 // 重新组合JSON字符串
                 var jsonString = string.Join("\n", jsonLines);
                 
-                _logger.LogDebug("准备解析JSON，长度: {Length} 字符", jsonString.Length);
+                _logger.LogInformation("准备解析JSON，长度: {Length} 字符，内容: {JsonString}", jsonString.Length, jsonString);
                 
                 var doc = JsonDocument.Parse(jsonString);
+                
+                // 如果令牌被更新，保存回数据库
+                if (File.Exists(tempFilePath))
+                {
+                    var updatedToken = await File.ReadAllTextAsync(tempFilePath);
+                    if (updatedToken != await File.ReadAllTextAsync(tempFilePath))
+                    {
+                        await SaveTokenToDatabase(userId, platformId, updatedToken);
+                    }
+                }
                 
                 // 检查是否有错误信息
                 if (doc.RootElement.TryGetProperty("success", out var success) && !success.GetBoolean())
@@ -680,22 +1216,27 @@ public class XboxService : IXboxService
             _logger.LogError(ex, "获取Xbox数据时发生错误");
             return null;
         }
+        finally
+        {
+            // 清理临时文件
+            CleanupTempTokenFile(tempFilePath);
+        }
     }
 
     /// <summary>
     /// 导入Xbox数据
     /// </summary>
-    public async Task<XboxImportResponseDto> ImportXboxData(XboxImportRequestDto request)
+    public async Task<XboxImportResponseDto> ImportXboxData(XboxImportRequestDto request, int userId)
     {
         try
         {
-            _logger.LogInformation("开始导入Xbox数据: xboxUserId={XboxUserId}", request.XboxUserId);
+            _logger.LogInformation("开始导入Xbox数据: xboxUserId={XboxUserId}, userId={UserId}", request.XboxUserId, userId);
 
             var taskId = $"import_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
             
             // 获取Xbox数据
             _logger.LogInformation("正在调用Python脚本获取Xbox数据...");
-            var xboxData = await GetXboxDataFromPython();
+            var xboxData = await GetXboxDataFromPython(userId, 7);
             
             if (xboxData == null)
             {
@@ -804,13 +1345,13 @@ public class XboxService : IXboxService
     /// <summary>
     /// 获取Xbox用户信息
     /// </summary>
-    public async Task<XboxUserDto?> GetXboxUser(string xuid)
+    public async Task<XboxUserDto?> GetXboxUser(string xuid, int userId)
     {
         try
         {
-            _logger.LogInformation("获取Xbox用户信息: xuid={Xuid}", xuid);
+            _logger.LogInformation("获取Xbox用户信息: xuid={Xuid}, userId={UserId}", xuid, userId);
 
-            var xboxData = await GetXboxDataFromPython();
+            var xboxData = await GetXboxDataFromPython(userId, 7);
             
             if (xboxData == null)
             {
@@ -858,13 +1399,13 @@ public class XboxService : IXboxService
     /// <summary>
     /// 获取Xbox游戏信息
     /// </summary>
-    public async Task<XboxGameDto?> GetXboxGame(string titleId)
+    public async Task<XboxGameDto?> GetXboxGame(string titleId, int userId)
     {
         try
         {
-            _logger.LogInformation("获取Xbox游戏信息: titleId={TitleId}", titleId);
+            _logger.LogInformation("获取Xbox游戏信息: titleId={TitleId}, userId={UserId}", titleId, userId);
 
-            var xboxData = await GetXboxDataFromPython();
+            var xboxData = await GetXboxDataFromPython(userId, 7);
             
             if (xboxData == null)
             {
@@ -971,13 +1512,13 @@ public class XboxService : IXboxService
     /// <summary>
     /// 获取Xbox用户的游戏列表（用于导入）
     /// </summary>
-    public async Task<List<XboxGameDto>> GetXboxUserGames(string xuid)
+    public async Task<List<XboxGameDto>> GetXboxUserGames(string xuid, int userId)
     {
         try
         {
-            _logger.LogInformation("获取Xbox用户游戏列表: xuid={Xuid}", xuid);
+            _logger.LogInformation("获取Xbox用户游戏列表: xuid={Xuid}, userId={UserId}", xuid, userId);
 
-            var xboxData = await GetXboxDataFromPython();
+            var xboxData = await GetXboxDataFromPython(userId, 7);
             
             if (xboxData == null)
             {
@@ -989,15 +1530,48 @@ public class XboxService : IXboxService
             // 从title_history中提取游戏信息
             if (xboxData.RootElement.TryGetProperty("title_history", out var titleHistory))
             {
+                _logger.LogInformation("找到title_history节点");
+                
+                // 检查是否有错误
+                if (titleHistory.TryGetProperty("error", out var error))
+                {
+                    var errorMsg = error.GetString();
+                    _logger.LogWarning("title_history包含错误信息: {Error}", errorMsg);
+                }
+                
                 if (titleHistory.TryGetProperty("titles", out var titles))
                 {
+                    var titlesCount = titles.GetArrayLength();
+                    _logger.LogInformation("找到 {Count} 个title记录", titlesCount);
+                    
+                    if (titlesCount == 0)
+                    {
+                        _logger.LogWarning("title_history.titles数组为空，可能用户没有游戏或API返回为空");
+                    }
+                    
+                    int processedCount = 0;
+                    int skippedCount = 0;
+                    
                     foreach (var title in titles.EnumerateArray())
                     {
                         var titleId = title.TryGetProperty("title_id", out var tid) ? tid.GetString() ?? "" : "";
                         var name = title.TryGetProperty("name", out var nameEl) ? nameEl.GetString() ?? "" : "";
+                        var type = title.TryGetProperty("type", out var typeEl) ? typeEl.GetString() ?? "game" : "game";
+                        
+                        _logger.LogDebug("处理title: TitleId={TitleId}, Name={Name}, Type={Type}", titleId, name, type);
+                        
+                        // 跳过非游戏类型（可选：如果需要只同步游戏）
+                        // if (!string.IsNullOrEmpty(type) && type.ToLower() != "game")
+                        // {
+                        //     _logger.LogDebug("跳过非游戏类型: Type={Type}", type);
+                        //     skippedCount++;
+                        //     continue;
+                        // }
                         
                         if (string.IsNullOrEmpty(titleId) || string.IsNullOrEmpty(name))
                         {
+                            _logger.LogDebug("跳过无效title: TitleId={TitleId}, Name={Name}", titleId, name);
+                            skippedCount++;
                             continue;
                         }
 
@@ -1005,7 +1579,7 @@ public class XboxService : IXboxService
                         {
                             TitleId = titleId,
                             Name = name,
-                            Type = title.TryGetProperty("type", out var typeEl) ? typeEl.GetString() ?? "game" : "game",
+                            Type = type, // 使用上面已经定义的type变量
                             IsFree = false, // Xbox API 不直接提供此信息
                             HeaderImage = title.TryGetProperty("display_image", out var img) ? img.GetString() ?? "" : ""
                         };
@@ -1092,7 +1666,26 @@ public class XboxService : IXboxService
                         }
 
                         games.Add(game);
+                        processedCount++;
+                        _logger.LogDebug("已添加游戏: {Name} (TitleId: {TitleId})", game.Name, game.TitleId);
                     }
+                    
+                    _logger.LogInformation("处理完成: 总计={Total}, 已处理={Processed}, 已跳过={Skipped}", 
+                        titlesCount, processedCount, skippedCount);
+                }
+                else
+                {
+                    _logger.LogWarning("title_history中没有titles数组");
+                }
+            }
+            else
+            {
+                _logger.LogWarning("Xbox数据中没有title_history节点");
+                // 输出所有可用的根节点，帮助调试
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    var propertyNames = xboxData.RootElement.EnumerateObject().Select(p => p.Name).ToList();
+                    _logger.LogDebug("可用的根节点: {Properties}", string.Join(", ", propertyNames));
                 }
             }
 
@@ -1107,15 +1700,87 @@ public class XboxService : IXboxService
     }
 
     /// <summary>
-    /// 获取Xbox用户成就
+    /// 获取Xbox游戏成就列表和玩家解锁状态
     /// </summary>
-    public async Task<List<XboxUserAchievementDto>> GetXboxUserAchievements(string xuid)
+    public async Task<List<XboxGameAchievementDto>> GetXboxGameAchievements(string xuid, int userId, string titleId)
     {
         try
         {
-            _logger.LogInformation("获取Xbox用户成就: xuid={Xuid}", xuid);
+            _logger.LogInformation("获取Xbox游戏成就: xuid={Xuid}, userId={UserId}, titleId={TitleId}", xuid, userId, titleId);
 
-            var xboxData = await GetXboxDataFromPython();
+            var achievementsData = await GetXboxGameAchievementsFromPython(userId, xuid, titleId);
+            
+            if (achievementsData == null)
+            {
+                _logger.LogWarning("无法获取游戏成就数据: titleId={TitleId}", titleId);
+                return new List<XboxGameAchievementDto>();
+            }
+
+            // 检查是否成功
+            if (achievementsData.RootElement.TryGetProperty("success", out var success) && !success.GetBoolean())
+            {
+                var errorMsg = achievementsData.RootElement.TryGetProperty("message", out var msg) 
+                    ? msg.GetString() ?? "未知错误" 
+                    : "未知错误";
+                _logger.LogWarning("获取游戏成就失败: titleId={TitleId}, error={Error}", titleId, errorMsg);
+                return new List<XboxGameAchievementDto>();
+            }
+
+            var achievements = new List<XboxGameAchievementDto>();
+
+            if (achievementsData.RootElement.TryGetProperty("achievements", out var achievementsArray))
+            {
+                foreach (var achElement in achievementsArray.EnumerateArray())
+                {
+                    try
+                    {
+                        var ach = new XboxGameAchievementDto
+                        {
+                            Id = achElement.TryGetProperty("id", out var idProp) ? idProp.GetString() ?? "" : "",
+                            Name = achElement.TryGetProperty("name", out var nameProp) ? nameProp.GetString() ?? "" : "",
+                            Description = achElement.TryGetProperty("description", out var descProp) ? descProp.GetString() ?? "" : "",
+                            LockedDescription = achElement.TryGetProperty("locked_description", out var lockedDescProp) ? lockedDescProp.GetString() ?? "" : "",
+                            ProgressState = achElement.TryGetProperty("progress_state", out var stateProp) ? stateProp.GetString() ?? "" : "",
+                            IsSecret = achElement.TryGetProperty("is_secret", out var secretProp) && secretProp.GetBoolean(),
+                            IsUnlocked = achElement.TryGetProperty("is_unlocked", out var unlockedProp) && unlockedProp.GetBoolean(),
+                            UnlockTime = achElement.TryGetProperty("unlock_time", out var timeProp) ? timeProp.GetString() : null,
+                            Gamerscore = achElement.TryGetProperty("gamerscore", out var scoreProp) ? SafeGetInt32(scoreProp) : 0,
+                            IconUnlocked = achElement.TryGetProperty("icon_unlocked", out var iconUnlockedProp) ? iconUnlockedProp.GetString() : null,
+                            IconLocked = achElement.TryGetProperty("icon_locked", out var iconLockedProp) ? iconLockedProp.GetString() : null
+                        };
+
+                        if (!string.IsNullOrEmpty(ach.Id))
+                        {
+                            achievements.Add(ach);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "解析成就数据失败: titleId={TitleId}", titleId);
+                    }
+                }
+            }
+
+            _logger.LogInformation("成功获取 {Count} 个游戏成就: titleId={TitleId}", achievements.Count, titleId);
+            return achievements;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "获取Xbox游戏成就时发生错误: titleId={TitleId}", titleId);
+            return new List<XboxGameAchievementDto>();
+        }
+    }
+
+    /// <summary>
+    /// 获取Xbox用户成就
+    /// </summary>
+    public async Task<List<XboxUserAchievementDto>> GetXboxUserAchievements(string xuid, int userId)
+    {
+        try
+        {
+            _logger.LogInformation("获取Xbox用户成就: xuid={Xuid}, userId={UserId}", xuid, userId);
+
+            var xboxData = await GetXboxDataFromPython(userId, 7);
             
             if (xboxData == null)
             {

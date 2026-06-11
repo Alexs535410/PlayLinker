@@ -61,7 +61,10 @@
       />
     </div>
 
-    <!-- 新闻详情弹窗 -->
+  </div>
+
+  <!-- 挂载到 body，避免父级 backdrop-filter 导致 fixed 定位偏移 -->
+  <Teleport to="body">
     <div v-if="showNewsModal" class="news-modal-overlay" @click.self="closeNewsModal">
       <div class="news-modal">
         <div class="news-modal-header">
@@ -107,7 +110,7 @@
         </div>
       </div>
     </div>
-  </div>
+  </Teleport>
 </template>
 
 <script setup>

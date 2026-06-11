@@ -462,6 +462,7 @@ import modExploreApi from '@/api/modExplore'
 import { getLocalGames } from '@/api/localGame'
 import { ArrowLeft, Clock, Trophy, Calendar, Package, Lock } from 'lucide-vue-next'
 import noCoverImage from '@/assets/no_cover.png'
+import { normalizeSteamImageUrl } from '@/utils/steamImage'
 
 const route = useRoute()
 const router = useRouter()
@@ -711,8 +712,8 @@ const loadAchievements = async () => {
           id: a.id || a.achievementId || a.AchievementId,
           name: a.displayName || a.DisplayName || a.name || a.achievementName || a.AchievementName,
           description: a.description || a.achievementDescription || a.Description,
-          iconUnlocked: a.iconUnlocked || a.IconUnlocked || a.icon,
-          iconLocked: a.iconLocked || a.IconLocked,
+          iconUnlocked: normalizeSteamImageUrl(a.iconUnlocked || a.IconUnlocked || a.icon),
+          iconLocked: normalizeSteamImageUrl(a.iconLocked || a.IconLocked),
           isUnlocked: unlocked !== undefined ? unlocked : (unlockTime != null),
           unlockTime,
           hidden,

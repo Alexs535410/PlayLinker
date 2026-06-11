@@ -545,6 +545,7 @@ public class ReportGenerationService
     {
         // 设置QuestPDF许可证（社区版免费）
         QuestPDF.Settings.License = LicenseType.Community;
+        ReportPdfFonts.EnsureRegistered(_logger);
 
         // 从 user_playtime_history 表计算月度时长增量
         var historyRecords = await _context.UserPlaytimeHistories
@@ -666,7 +667,7 @@ public class ReportGenerationService
                 page.Size(PageSizes.A4);
                 page.Margin(1.5f, Unit.Centimetre);
                 page.PageColor(darkBg);
-                page.DefaultTextStyle(x => x.FontSize(11).FontColor(textLight).FontFamily("Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "Arial"));
+                page.DefaultTextStyle(x => x.FontSize(11).FontColor(textLight).FontFamily(ReportPdfFonts.ChineseFontFamily));
 
                 // 页眉
                 page.Header()
@@ -1334,6 +1335,7 @@ public class ReportGenerationService
     public async Task<byte[]> GenerateYearlyReportPdf(int userId, int year)
     {
         QuestPDF.Settings.License = LicenseType.Community;
+        ReportPdfFonts.EnsureRegistered(_logger);
 
         var startDate = new DateTime(year, 1, 1);
         var endDate = new DateTime(year, 12, 31);
@@ -1479,7 +1481,7 @@ public class ReportGenerationService
                 page.Size(PageSizes.A4);
                 page.Margin(1.5f, Unit.Centimetre);
                 page.PageColor(darkBg);
-                page.DefaultTextStyle(x => x.FontSize(11).FontColor(textLight).FontFamily("Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "Arial"));
+                page.DefaultTextStyle(x => x.FontSize(11).FontColor(textLight).FontFamily(ReportPdfFonts.ChineseFontFamily));
 
                 page.Header().PaddingBottom(15).Column(col =>
                 {
@@ -2225,6 +2227,7 @@ public class ReportGenerationService
     public async Task<byte[]> GenerateInventoryReportPdf(int userId)
     {
         QuestPDF.Settings.License = LicenseType.Community;
+        ReportPdfFonts.EnsureRegistered(_logger);
 
         // 获取用户绑定的平台用户ID
         var platformUserIds = await _context.UserPlatformBindings
@@ -2299,7 +2302,7 @@ public class ReportGenerationService
                 page.Size(PageSizes.A4);
                 page.Margin(1.5f, Unit.Centimetre);
                 page.PageColor(darkBg);
-                page.DefaultTextStyle(x => x.FontSize(10).FontColor(textLight).FontFamily("Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "Arial"));
+                page.DefaultTextStyle(x => x.FontSize(10).FontColor(textLight).FontFamily(ReportPdfFonts.ChineseFontFamily));
 
                 page.Header().PaddingBottom(15).Column(col =>
                 {

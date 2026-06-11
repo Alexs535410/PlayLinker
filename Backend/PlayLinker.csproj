@@ -33,5 +33,11 @@
     <None Include="Tests/**/*.cs" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Update="Fonts\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>
 

@@ -780,7 +780,7 @@ const lastMonth = getLastMonthYearAndMonth()
 
 const monthlyYear = ref(lastMonth.year)
 const monthlyMonth = ref(lastMonth.month)
-const yearlyYear = ref(currentYear - 1) // 默认选择去年
+const yearlyYear = ref(currentYear)
 
 // 月份/年份选择器状态
 const showMonthPicker = ref(false)
@@ -790,12 +790,12 @@ const pickerYear = ref(lastMonth.year)
 // 导出对话框的选择器状态
 const showExportMonthPicker = ref(false)
 const showExportYearPicker = ref(false)
-const exportPickerYear = ref(lastMonth.year)
+const exportPickerYear = ref(currentYear)
 
-// 判断月份是否禁用（未完成的月份）
+// 判断月份是否禁用（未来月份不可选，当前月可选）
 const isMonthDisabled = (year, month) => {
   if (year > currentYear) return true
-  if (year === currentYear && month >= currentMonth) return true
+  if (year === currentYear && month > currentMonth) return true
   return false
 }
 
@@ -842,8 +842,8 @@ const closePickersOnClickOutside = (e) => {
 
 const exportForm = ref({
   type: 'monthly',
-  year: lastMonth.year,
-  month: lastMonth.month,
+  year: currentYear,
+  month: currentMonth,
   format: 'pdf'
 })
 
@@ -856,20 +856,20 @@ const monthlyYearOptions = computed(() => {
   return years
 })
 
-// Month options for monthly report (only completed months)
+// Month options for monthly report（含当前月）
 const monthlyMonthOptions = computed(() => {
   const months = []
-  const maxMonth = monthlyYear.value === currentYear ? currentMonth - 1 : 12
+  const maxMonth = monthlyYear.value === currentYear ? currentMonth : 12
   for (let m = 1; m <= maxMonth; m++) {
     months.push(m)
   }
   return months
 })
 
-// Year options for yearly report (only completed years, excluding current year)
+// Year options for yearly report（近 5 年，含当前年）
 const yearlyYearOptions = computed(() => {
   const years = []
-  for (let i = currentYear - 1; i >= currentYear - 5; i--) {
+  for (let i = currentYear; i >= currentYear - 4; i--) {
     years.push(i)
   }
   return years
@@ -877,7 +877,7 @@ const yearlyYearOptions = computed(() => {
 
 // Watch for monthly year change to reset month if needed
 watch(() => monthlyYear.value, (newYear) => {
-  const maxMonth = newYear === currentYear ? currentMonth - 1 : 12
+  const maxMonth = newYear === currentYear ? currentMonth : 12
   if (monthlyMonth.value > maxMonth) {
     monthlyMonth.value = maxMonth
   }

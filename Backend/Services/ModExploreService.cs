@@ -103,6 +103,9 @@ public class ModExploreService : IModExploreService
 
     #region NexusMods API
 
+    // REST API 各 feed 固定返回约 10 条，按页轮换不同列表供下拉加载
+    private static readonly string[] NexusFeedEndpoints = ["latest_added", "trending", "latest_updated"];
+
     private async Task<ModExploreResponse> GetNexusModsAsync(
         PlayLinker.Models.Entities.GameModSource mapping, 
         ModExploreRequest request)
@@ -116,8 +119,22 @@ public class ModExploreService : IModExploreService
                 return CreateEmptyResponse(request, mapping.Game?.Name ?? "");
             }
 
+            var feedIndex = request.Page - 1;
+            if (feedIndex < 0 || feedIndex >= NexusFeedEndpoints.Length)
+            {
+                return new ModExploreResponse
+                {
+                    Mods = new List<ExploreModItemDto>(),
+                    Total = NexusFeedEndpoints.Length * 10,
+                    Page = request.Page,
+                    PageSize = request.PageSize,
+                    Source = "NexusMods",
+                    GameName = mapping.Game?.Name ?? ""
+                };
+            }
+
             var domain = mapping.ExternalDomain ?? "";
-            var url = $"https://api.nexusmods.com/v1/games/{domain}/mods/latest_added.json";
+            var url = $"https://api.nexusmods.com/v1/games/{domain}/mods/{NexusFeedEndpoints[feedIndex]}.json";
 
             _httpClient.DefaultRequestHeaders.Clear();
             _httpClient.DefaultRequestHeaders.Add("apikey", apiKey);
@@ -154,7 +171,7 @@ public class ModExploreService : IModExploreService
                     Category = m.CategoryId.ToString(),
                     AdultContent = m.ContainsAdultContent
                 }).ToList() ?? new List<ExploreModItemDto>(),
-                Total = mods?.Count ?? 0,
+                Total = NexusFeedEndpoints.Length * 10,
                 Page = request.Page,
                 PageSize = request.PageSize,
                 Source = "NexusMods",

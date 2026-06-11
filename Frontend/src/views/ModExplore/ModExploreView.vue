@@ -134,13 +134,13 @@
       <p>正在加载 Mod 来源...</p>
     </div>
 
-    <div v-else-if="loading" class="loading-state">
+    <div v-else-if="loading && mods.length === 0" class="loading-state">
       <div class="loader"></div>
       <p>正在加载 Mod 列表...</p>
     </div>
 
-    <div v-else-if="mods.length > 0" class="mod-grid">
-      <div v-for="mod in mods" :key="mod.modId" class="mod-card">
+    <div v-if="mods.length > 0" class="mod-grid">
+      <div v-for="mod in mods" :key="`${mod.source}-${mod.modId}`" class="mod-card">
         <div class="card-image">
           <img v-if="mod.thumbnailUrl" :src="mod.thumbnailUrl" :alt="mod.name" @error="handleImageError" />
           <div v-else class="image-placeholder">
@@ -163,7 +163,15 @@
       </div>
     </div>
 
-    <div v-else-if="selectedGameId && selectedSource && !loading && !sourcesLoading && modSources.length > 0" class="empty-state">
+    <div v-if="loadingMore" class="loading-more">
+      <div class="mini-loader"></div>
+      <span>加载更多 Mod...</span>
+    </div>
+
+    <p v-if="isNexus && mods.length > 0 && nexusHasMore && !loadingMore" class="scroll-hint">向下滚动加载更多</p>
+    <p v-if="isNexus && mods.length > 0 && !nexusHasMore" class="scroll-hint done">已加载全部可用 Mod</p>
+
+    <div v-else-if="selectedGameId && selectedSource && !loading && !sourcesLoading && modSources.length > 0 && mods.length === 0" class="empty-state">
       <Package class="empty-icon" />
       <h3>在 {{ selectedSourceName }} 上暂无 Mod</h3>
       <p>该游戏在 {{ selectedSourceName }} 平台上目前没有可用的 Mod</p>
@@ -182,6 +190,7 @@
     </div>
 
     <Pagination
+      v-if="!isNexus"
       :current-page="currentPage"
       :total-pages="totalPages"
       @page-change="changePage"
@@ -200,8 +209,12 @@ import { libraryApi } from '@/api/index'
 import { searchGames } from '@/api/games'
 import Pagination from '@/components/common/Pagination.vue'
 
+const NEXUS_FEED_PAGES = 3
+
 // State
 const loading = ref(false)
+const loadingMore = ref(false)
+const nexusHasMore = ref(true)
 const sourcesLoading = ref(false)
 const dropdownOpen = ref(false)
 const libraryGames = ref([])
@@ -228,6 +241,7 @@ const selectionMode = ref(null)
 
 // Computed
 const totalPages = computed(() => Math.ceil(totalMods.value / pageSize.value))
+const isNexus = computed(() => selectedSource.value.toLowerCase() === 'nexusmods')
 const selectedSourceName = computed(() => {
   const source = modSources.value.find(s => s.source === selectedSource.value)
   return source?.displayName || selectedSource.value
@@ -243,13 +257,24 @@ const handleClickOutside = (e) => {
   }
 }
 
+const handleScroll = () => {
+  if (!isNexus.value || searchQuery.value.trim() || !nexusHasMore.value || loading.value || loadingMore.value) return
+  const nearBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 200
+  if (nearBottom) {
+    currentPage.value++
+    loadMods(true)
+  }
+}
+
 onMounted(() => {
   loadLibraryGames()
   document.addEventListener('click', handleClickOutside)
+  window.addEventListener('scroll', handleScroll)
 })
 
 onUnmounted(() => {
   document.removeEventListener('click', handleClickOutside)
+  window.removeEventListener('scroll', handleScroll)
   if (searchDebounceTimer) clearTimeout(searchDebounceTimer)
 })
 
@@ -412,31 +437,47 @@ const selectSource = async (source) => {
   await loadMods()
 }
 
-const loadMods = async () => {
+const loadMods = async (append = false) => {
   if (!selectedGameId.value || !selectedSource.value) return
+  if (append && (!nexusHasMore.value || loadingMore.value)) return
 
-  loading.value = true
-  mods.value = []
+  if (append) {
+    loadingMore.value = true
+  } else {
+    loading.value = true
+    mods.value = []
+    nexusHasMore.value = true
+  }
   
   try {
-    console.log('加载 Mod 列表:', { gameId: selectedGameId.value, source: selectedSource.value })
     const res = await getModList({
       gameId: selectedGameId.value,
       source: selectedSource.value,
       page: currentPage.value,
       pageSize: pageSize.value
     })
-    console.log('Mod 列表响应:', res)
     
-    // 解析响应
     const data = res.data || res
-    mods.value = data.mods || []
+    const batch = data.mods || []
     totalMods.value = data.total || 0
+
+    if (append) {
+      const existing = new Set(mods.value.map(m => m.modId))
+      mods.value.push(...batch.filter(m => !existing.has(m.modId)))
+    } else {
+      mods.value = batch
+    }
+
+    if (isNexus.value) {
+      nexusHasMore.value = batch.length > 0 && currentPage.value < NEXUS_FEED_PAGES
+    }
   } catch (error) {
     console.error('加载 Mod 列表失败:', error)
-    mods.value = []
+    if (!append) mods.value = []
+    nexusHasMore.value = false
   } finally {
     loading.value = false
+    loadingMore.value = false
   }
 }
 
@@ -1241,6 +1282,27 @@ const handleIconError = (e) => { e.target.style.display = 'none' }
   border-top-color: #8b5cf6;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+}
+
+.loading-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px 0 8px;
+  color: #94a3b8;
+  font-size: 14px;
+}
+
+.scroll-hint {
+  text-align: center;
+  color: #64748b;
+  font-size: 13px;
+  margin: 8px 0 24px;
+}
+
+.scroll-hint.done {
+  color: #4a5568;
 }
 
 /* Responsive */

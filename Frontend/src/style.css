@@ -43,6 +43,10 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.5);
+
+  /* 背景视差偏移（由 useParallaxBackground 动态更新） */
+  --bg-offset-x: 0px;
+  --bg-offset-y: 0px;
 }
 
 * {
@@ -59,11 +63,10 @@ body {
     linear-gradient(rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0.7)), 
     url('./assets/bg.jpg'); /* 替换为你的图片路径，如果是网络图片直接填 URL */
   
-  /* 确保背景覆盖整个屏幕 */
-  background-size: cover;
-  /* 背景图居中 */
-  background-position: center;
-  /* 背景图固定，不随滚动条滚动 */
+  /* 略大于视口，避免视差移动时露出边缘 */
+  background-size: 108% 108%;
+  background-position: calc(50% + var(--bg-offset-x)) calc(50% + var(--bg-offset-y));
+  transition: background-position 0.2s ease-out;
   background-attachment: fixed;
   /*以此颜色作为图片加载前的底色 */
   background-color: var(--bg-primary); 
